@@ -11,12 +11,7 @@ CREATE TABLE piece_upgrades (
                                 CONSTRAINT fk_piece_upgrades_match_id
                                     FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
                                 CONSTRAINT fk_piece_upgrades_result_piece
-                                    FOREIGN KEY (result_piece_id) REFERENCES pieces(id) ON DELETE RESTRICT,
-
-                                CONSTRAINT chk_piece_upgrades_unique_sources CHECK (
-                                    source_piece1_id != source_piece2_id AND
-                                    source_piece1_id != source_piece3_id AND
-                                    source_piece2_id != source_piece3_id)
+                                    FOREIGN KEY (result_piece_id) REFERENCES pieces(id) ON DELETE RESTRICT
     );
 
 CREATE INDEX idx_piece_upgrades_match_id ON piece_upgrades(match_id);

@@ -17,8 +17,7 @@ CREATE TABLE shop_offers (
                              CONSTRAINT chk_shop_offers_slot CHECK (slot_number >= 1 AND slot_number <= 5),
                              CONSTRAINT chk_shop_offers_purchase CHECK (
                                  (purchased_by IS NULL AND purchased_at IS NULL) OR
-                                 (purchased_by IS NOT NULL AND purchased_at IS NOT NULL)
-                                 ),
+                                 (purchased_by IS NOT NULL AND purchased_at IS NOT NULL))
 
 );
 
