@@ -5,13 +5,7 @@ CREATE TABLE matches (
                          winner_id BIGINT,
                          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                         finished_at TIMESTAMP,
-
-    CONSTRAINT chk_matches_current_round CHECK (current_round > 0),
-    CONSTRAINT chk_matches_status CHECK (
-        status IN ('WAITING', 'IN_PROGRESS', 'COMPLETED', 'ABANDONED')
-    )
+                         finished_at TIMESTAMP
 );
-
 CREATE INDEX idx_matches_status ON matches(status);
 CREATE INDEX idx_matches_created_at ON matches(created_at DESC);

@@ -12,9 +12,6 @@ CREATE TABLE piece_upgrades (
                                     FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
                                 CONSTRAINT fk_piece_upgrades_result_piece
                                     FOREIGN KEY (result_piece_id) REFERENCES pieces(id) ON DELETE RESTRICT
-    );
-
+);
 CREATE INDEX idx_piece_upgrades_match_id ON piece_upgrades(match_id);
 CREATE INDEX idx_piece_upgrades_user_id ON piece_upgrades(user_id);
-CREATE INDEX idx_piece_upgrades_result_id ON piece_upgrades(result_piece_id);
-CREATE INDEX idx_piece_upgrades_time ON piece_upgrades(upgraded_at DESC);
