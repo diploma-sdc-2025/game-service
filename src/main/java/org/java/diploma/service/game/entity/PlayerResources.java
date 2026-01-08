@@ -7,32 +7,50 @@ import lombok.Setter;
 
 import java.time.Instant;
 
-@Getter @Setter @NoArgsConstructor
+@Getter
+@Setter
+@NoArgsConstructor
 @Entity
-@Table(name = "player_resources",
-        uniqueConstraints = @UniqueConstraint(name = "uq_player_resources_match_user", columnNames = {"match_id", "user_id"}))
+@Table(name = PlayerResources.TABLE_NAME,
+        uniqueConstraints = @UniqueConstraint(
+                name = PlayerResources.CONSTRAINT_UNIQUE_PLAYER_RESOURCES,
+                columnNames = {PlayerResources.COLUMN_MATCH_ID, PlayerResources.COLUMN_USER_ID}
+        ))
 public class PlayerResources {
+
+    static final String TABLE_NAME = "player_resources";
+    static final String CONSTRAINT_UNIQUE_PLAYER_RESOURCES = "uq_player_resources_match_user";
+    static final String COLUMN_MATCH_ID = "match_id";
+    static final String COLUMN_USER_ID = "user_id";
+    private static final String COLUMN_GOLD = "gold";
+    private static final String COLUMN_LEVEL = "level";
+    private static final String COLUMN_EXPERIENCE = "experience";
+    private static final String COLUMN_UPDATED_AT = "updated_at";
+
+    public static final int DEFAULT_GOLD = 0;
+    public static final int DEFAULT_LEVEL = 1;
+    public static final int DEFAULT_EXPERIENCE = 0;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Integer id;
 
-    @Column(name = "match_id", nullable = false)
+    @Column(name = COLUMN_MATCH_ID, nullable = false)
     private Integer matchId;
 
-    @Column(name = "user_id", nullable = false)
+    @Column(name = COLUMN_USER_ID, nullable = false)
     private Long userId;
 
-    @Column(nullable = false)
-    private int gold = 0;
+    @Column(name = COLUMN_GOLD, nullable = false)
+    private int gold = DEFAULT_GOLD;
 
-    @Column(nullable = false)
-    private int level = 1;
+    @Column(name = COLUMN_LEVEL, nullable = false)
+    private int level = DEFAULT_LEVEL;
 
-    @Column(nullable = false)
-    private int experience = 0;
+    @Column(name = COLUMN_EXPERIENCE, nullable = false)
+    private int experience = DEFAULT_EXPERIENCE;
 
-    @Column(name = "updated_at", nullable = false)
+    @Column(name = COLUMN_UPDATED_AT, nullable = false)
     private Instant updatedAt;
 
     @PrePersist

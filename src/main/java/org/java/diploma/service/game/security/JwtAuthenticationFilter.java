@@ -7,6 +7,8 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -21,6 +23,16 @@ import java.util.Collections;
 @Component
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
+    private static final Logger logger = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
+
+    private static final String HEADER_AUTHORIZATION = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
+    private static final int BEARER_PREFIX_LENGTH = 7;
+
+    private static final String JWT_VALIDATION_FAILED = "JWT validation failed: {}";
+    private static final String USER_AUTHENTICATED = "User authenticated: userId={}";
+    private static final String NO_AUTH_HEADER = "No Authorization header present";
+
     private final SecretKey key;
 
     public JwtAuthenticationFilter(@Value("${auth.jwt.secret}") String secret) {
@@ -31,21 +43,25 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
 
-        String header = request.getHeader("Authorization");
-        if (header == null || !header.startsWith("Bearer ")) {
+        String header = request.getHeader(HEADER_AUTHORIZATION);
+        if (header == null || !header.startsWith(BEARER_PREFIX)) {
+            logger.debug(NO_AUTH_HEADER);
             chain.doFilter(request, response);
             return;
         }
 
         try {
-            String token = header.substring(7);
+            String token = header.substring(BEARER_PREFIX_LENGTH);
             Claims claims = Jwts.parser().verifyWith(key).build()
                     .parseSignedClaims(token).getPayload();
 
-            String userId = claims.getSubject(); // userId stored in sub
+            String userId = claims.getSubject();
             var auth = new UsernamePasswordAuthenticationToken(userId, null, Collections.emptyList());
             SecurityContextHolder.getContext().setAuthentication(auth);
+
+            logger.debug(USER_AUTHENTICATED, userId);
         } catch (Exception e) {
+            logger.warn(JWT_VALIDATION_FAILED, e.getMessage());
             SecurityContextHolder.clearContext();
         }
 
