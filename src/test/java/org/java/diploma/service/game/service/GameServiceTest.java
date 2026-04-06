@@ -6,6 +6,8 @@ import org.java.diploma.service.game.entity.Match;
 import org.java.diploma.service.game.entity.MatchPlayer;
 import org.java.diploma.service.game.repository.MatchPlayerRepository;
 import org.java.diploma.service.game.repository.MatchRepository;
+import org.java.diploma.service.game.repository.PieceRepository;
+import org.java.diploma.service.game.repository.PlayerInventoryRepository;
 import org.java.diploma.service.game.repository.PlayerResourcesRepository;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -23,6 +25,8 @@ class GameServiceTest {
         var matches = mock(MatchRepository.class);
         var matchPlayers = mock(MatchPlayerRepository.class);
         var resources = mock(PlayerResourcesRepository.class);
+        var pieces = mock(PieceRepository.class);
+        var inventory = mock(PlayerInventoryRepository.class);
         var redisState = mock(GameStateRedisService.class);
 
         when(matches.save(any(Match.class))).thenAnswer(inv -> {
@@ -31,7 +35,7 @@ class GameServiceTest {
             return m;
         });
 
-        var sut = new GameService(matches, matchPlayers, resources, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
 
         var req = new CreateMatchRequest(List.of(10L, 20L, 30L));
         MatchResponse res = sut.createMatch(req);
@@ -61,11 +65,13 @@ class GameServiceTest {
         var matches = mock(MatchRepository.class);
         var matchPlayers = mock(MatchPlayerRepository.class);
         var resources = mock(PlayerResourcesRepository.class);
+        var pieces = mock(PieceRepository.class);
+        var inventory = mock(PlayerInventoryRepository.class);
         var redisState = mock(GameStateRedisService.class);
 
         when(matches.findById(999)).thenReturn(Optional.empty());
 
-        var sut = new GameService(matches, matchPlayers, resources, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
 
         assertThatThrownBy(() -> sut.getMatch(999))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -77,6 +83,8 @@ class GameServiceTest {
         var matches = mock(MatchRepository.class);
         var matchPlayers = mock(MatchPlayerRepository.class);
         var resources = mock(PlayerResourcesRepository.class);
+        var pieces = mock(PieceRepository.class);
+        var inventory = mock(PlayerInventoryRepository.class);
         var redisState = mock(GameStateRedisService.class);
 
         Match m = new Match();
@@ -84,7 +92,7 @@ class GameServiceTest {
         m.setStatus("IN_PROGRESS");
         when(matches.findById(1)).thenReturn(Optional.of(m));
 
-        var sut = new GameService(matches, matchPlayers, resources, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
 
         assertThatThrownBy(() -> sut.startMatch(1))
                 .isInstanceOf(IllegalStateException.class)
@@ -98,6 +106,8 @@ class GameServiceTest {
         var matches = mock(MatchRepository.class);
         var matchPlayers = mock(MatchPlayerRepository.class);
         var resources = mock(PlayerResourcesRepository.class);
+        var pieces = mock(PieceRepository.class);
+        var inventory = mock(PlayerInventoryRepository.class);
         var redisState = mock(GameStateRedisService.class);
 
         Match m = new Match();
@@ -105,7 +115,7 @@ class GameServiceTest {
         m.setStatus("WAITING");
         when(matches.findById(1)).thenReturn(Optional.of(m));
 
-        var sut = new GameService(matches, matchPlayers, resources, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
 
         sut.startMatch(1);
 
@@ -118,6 +128,8 @@ class GameServiceTest {
         var matches = mock(MatchRepository.class);
         var matchPlayers = mock(MatchPlayerRepository.class);
         var resources = mock(PlayerResourcesRepository.class);
+        var pieces = mock(PieceRepository.class);
+        var inventory = mock(PlayerInventoryRepository.class);
         var redisState = mock(GameStateRedisService.class);
 
         Match m = new Match();
@@ -131,7 +143,7 @@ class GameServiceTest {
                 player(20L)
         ));
 
-        var sut = new GameService(matches, matchPlayers, resources, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
 
         MatchResponse res = sut.getMatch(5);
 
