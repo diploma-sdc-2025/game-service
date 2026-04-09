@@ -1,15 +1,20 @@
 package org.java.diploma.service.game.controller;
 
 import jakarta.validation.Valid;
+import org.java.diploma.service.game.dto.BattleRoundEvaluationResponse;
 import org.java.diploma.service.game.dto.BuyPieceRequest;
 import org.java.diploma.service.game.dto.BuyPieceResponse;
 import org.java.diploma.service.game.dto.CreateMatchRequest;
 import org.java.diploma.service.game.dto.MatchResponse;
+import org.java.diploma.service.game.dto.MoveKingRequest;
 import org.java.diploma.service.game.dto.MovePieceRequest;
 import org.java.diploma.service.game.dto.PlacePieceRequest;
+import org.java.diploma.service.game.dto.SellPieceRequest;
+import org.java.diploma.service.game.dto.SellPieceResponse;
 import org.java.diploma.service.game.dto.ShopStateResponse;
 import org.java.diploma.service.game.service.GameService;
 import org.java.diploma.service.game.service.GameStateRedisService;
+import org.java.diploma.service.game.service.MatchBattleEvaluationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.core.Authentication;
@@ -32,15 +37,22 @@ public class GameController {
     private static final String CREATE_MATCH_REQUEST = "Received create match request for {} players";
     private static final String SHOP_RETRIEVED = "Shop state retrieved: matchId={}, userId={}";
     private static final String PIECE_BOUGHT = "Piece bought: matchId={}, userId={}, piece={}";
+    private static final String PIECE_SOLD = "Piece sold: matchId={}, userId={}, piece={}";
     private static final String PIECE_PLACED = "Piece placed on board: matchId={}, userId={}";
     private static final String PIECE_MOVED = "Board piece moved: matchId={}, userId={}";
+    private static final String KING_MOVED = "King moved: matchId={}, userId={}";
+    private static final String BATTLE_EVAL = "Battle round evaluation: matchId={}, userId={}";
 
     private final GameService game;
     private final GameStateRedisService redisState;
+    private final MatchBattleEvaluationService battleEvaluation;
 
-    public GameController(GameService game, GameStateRedisService redisState) {
+    public GameController(GameService game,
+                          GameStateRedisService redisState,
+                          MatchBattleEvaluationService battleEvaluation) {
         this.game = game;
         this.redisState = redisState;
+        this.battleEvaluation = battleEvaluation;
     }
 
     @PostMapping("/matches")
@@ -85,6 +97,8 @@ public class GameController {
             return game.getShopState(matchId, userId);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
         }
     }
 
@@ -96,6 +110,22 @@ public class GameController {
         try {
             BuyPieceResponse response = game.buyPiece(matchId, userId, req);
             logger.info(PIECE_BOUGHT, matchId, userId, response.piece());
+            return response;
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        }
+    }
+
+    @PostMapping("/matches/{matchId}/inventory/sell")
+    public SellPieceResponse sellPiece(@PathVariable Integer matchId,
+                                       @Valid @RequestBody SellPieceRequest req,
+                                       Authentication authentication) {
+        Long userId = requireUserId(authentication);
+        try {
+            SellPieceResponse response = game.sellPiece(matchId, userId, req);
+            logger.info(PIECE_SOLD, matchId, userId, response.piece());
             return response;
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
@@ -129,6 +159,36 @@ public class GameController {
             game.moveBoardPiece(matchId, userId, req);
             logger.info(PIECE_MOVED, matchId, userId);
             return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        }
+    }
+
+    @PostMapping("/matches/{matchId}/king/move")
+    public ResponseEntity<Void> moveKing(@PathVariable Integer matchId,
+                                        @Valid @RequestBody MoveKingRequest req,
+                                        Authentication authentication) {
+        Long userId = requireUserId(authentication);
+        try {
+            game.moveKing(matchId, userId, req);
+            logger.info(KING_MOVED, matchId, userId);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        }
+    }
+
+    @PostMapping("/matches/{matchId}/battle/evaluate-round")
+    public BattleRoundEvaluationResponse evaluateBattleRound(@PathVariable Integer matchId,
+                                                             Authentication authentication) {
+        Long userId = requireUserId(authentication);
+        logger.info(BATTLE_EVAL, matchId, userId);
+        try {
+            return battleEvaluation.evaluateRound(matchId, userId);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (IllegalStateException e) {

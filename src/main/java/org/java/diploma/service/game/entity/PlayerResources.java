@@ -25,11 +25,14 @@ public class PlayerResources {
     private static final String COLUMN_GOLD = "gold";
     private static final String COLUMN_LEVEL = "level";
     private static final String COLUMN_EXPERIENCE = "experience";
+    private static final String COLUMN_HP = "hp";
     private static final String COLUMN_UPDATED_AT = "updated_at";
 
     public static final int DEFAULT_GOLD = 0;
     public static final int DEFAULT_LEVEL = 1;
     public static final int DEFAULT_EXPERIENCE = 0;
+    /** Starting / max HP for the vertical HP bar (battle damage subtracts from this). */
+    public static final int DEFAULT_HP = 100;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -49,6 +52,9 @@ public class PlayerResources {
 
     @Column(name = COLUMN_EXPERIENCE, nullable = false)
     private int experience = DEFAULT_EXPERIENCE;
+
+    @Column(name = COLUMN_HP, nullable = false)
+    private int hp = DEFAULT_HP;
 
     @Column(name = COLUMN_UPDATED_AT, nullable = false)
     private Instant updatedAt;

@@ -9,6 +9,7 @@ import org.java.diploma.service.game.repository.MatchRepository;
 import org.java.diploma.service.game.repository.PieceRepository;
 import org.java.diploma.service.game.repository.PlayerInventoryRepository;
 import org.java.diploma.service.game.repository.PlayerResourcesRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -35,7 +36,7 @@ class GameServiceTest {
             return m;
         });
 
-        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState, new ObjectMapper());
 
         var req = new CreateMatchRequest(List.of(10L, 20L, 30L));
         MatchResponse res = sut.createMatch(req);
@@ -71,7 +72,7 @@ class GameServiceTest {
 
         when(matches.findById(999)).thenReturn(Optional.empty());
 
-        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState, new ObjectMapper());
 
         assertThatThrownBy(() -> sut.getMatch(999))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -92,7 +93,7 @@ class GameServiceTest {
         m.setStatus("IN_PROGRESS");
         when(matches.findById(1)).thenReturn(Optional.of(m));
 
-        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState, new ObjectMapper());
 
         assertThatThrownBy(() -> sut.startMatch(1))
                 .isInstanceOf(IllegalStateException.class)
@@ -115,7 +116,7 @@ class GameServiceTest {
         m.setStatus("WAITING");
         when(matches.findById(1)).thenReturn(Optional.of(m));
 
-        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState, new ObjectMapper());
 
         sut.startMatch(1);
 
@@ -143,7 +144,7 @@ class GameServiceTest {
                 player(20L)
         ));
 
-        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState);
+        var sut = new GameService(matches, matchPlayers, resources, pieces, inventory, redisState, new ObjectMapper());
 
         MatchResponse res = sut.getMatch(5);
 

@@ -1,13 +1,21 @@
 package org.java.diploma.service.game.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.java.diploma.service.game.dto.BattleRoundEvaluationResponse;
+import org.java.diploma.service.game.dto.BattleRoundHpSnapshot;
 import org.java.diploma.service.game.dto.BenchSlotResponse;
 import org.java.diploma.service.game.dto.BoardPieceResponse;
 import org.java.diploma.service.game.dto.CreateMatchRequest;
 import org.java.diploma.service.game.dto.BuyPieceRequest;
 import org.java.diploma.service.game.dto.BuyPieceResponse;
+import org.java.diploma.service.game.dto.KingSquareResponse;
 import org.java.diploma.service.game.dto.MatchResponse;
+import org.java.diploma.service.game.dto.MoveKingRequest;
 import org.java.diploma.service.game.dto.MovePieceRequest;
 import org.java.diploma.service.game.dto.PlacePieceRequest;
+import org.java.diploma.service.game.dto.SellPieceRequest;
+import org.java.diploma.service.game.dto.SellPieceResponse;
 import org.java.diploma.service.game.dto.ShopItemResponse;
 import org.java.diploma.service.game.dto.ShopStateResponse;
 import org.java.diploma.service.game.entity.Match;
@@ -24,6 +32,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -44,11 +54,23 @@ public class GameService {
     private static final String LOG_BUY_PIECE = "Buying piece: matchId={}, userId={}, piece={}";
     private static final String LOG_PLACE_PIECE = "Placing piece from bench: matchId={}, userId={}, benchSlot={}, squareX={}, squareY={}";
     private static final String LOG_MOVE_PIECE = "Moving board piece: matchId={}, userId={}, from=({},{}), to=({},{})";
+    private static final String LOG_SELL_PIECE = "Piece sold: matchId={}, userId={}, piece={}, refund={}";
 
     /** Bench rows use this Y so they never collide with board squares (0–7). */
     private static final int BENCH_POSITION_Y = 8;
-    private static final int WHITE_KING_HOME_COL = 4;
-    private static final int WHITE_KING_HOME_ROW = 7;
+
+    /**
+     * White POV: UI row 0 = rank 8, row 7 = rank 1. Pawns may only sit on chess ranks 2–4 → rows 4–6.
+     */
+    private static final int PAWN_RANK_MIN_ROW = 4;
+    private static final int PAWN_RANK_MAX_ROW = 6;
+
+    /** Any file a–h is allowed for king movement → columns 0–7. */
+    private static final int KING_LANE_MIN_COL = 0;
+    private static final int KING_LANE_MAX_COL = 7;
+    /** White POV rows for ranks 1–4 only. Ranks 5–8 (rows 0–3) are blocked. */
+    private static final int KING_RANK_MIN_ROW = 4;
+    private static final int KING_RANK_MAX_ROW = 7;
 
     private static final String ERROR_MATCH_NOT_FOUND_MESSAGE = "Match not found: ";
     private static final String ERROR_MATCH_NOT_WAITING_MESSAGE = "Match is not in WAITING state";
@@ -61,6 +83,16 @@ public class GameService {
     private static final String MATCH_STATE_INITIALIZED = "Match state initialized in Redis: matchId={}";
     private static final String MATCH_RETRIEVED = "Match retrieved: matchId={}";
     private static final String MATCH_STARTED = "Match started: matchId={}";
+    private static final String LOG_BATTLE_HP = "Battle HP update: matchId={}, centipawns={}, loserUserId={}, damage={}";
+    private static final String LOG_BATTLE_PAWNS = "Battle round pawn income: matchId={}, userId={}, +{}";
+
+    /**
+     * Max HP removed per round after converting eval to pawns ({@code round(|cp|/100)}). Prevents one-shot wipes
+     * from extreme engine scores while matching the eval bar scale (e.g. 5.7 pawns → ~6 HP, not 10).
+     */
+    private static final int BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED = 25;
+    /** Each side receives this many pawns (gold) when a battle round is resolved. */
+    private static final int BATTLE_ROUND_PAWNS_PER_SIDE = 2;
 
     private final MatchRepository matches;
     private final MatchPlayerRepository matchPlayers;
@@ -68,19 +100,22 @@ public class GameService {
     private final PieceRepository pieces;
     private final PlayerInventoryRepository inventory;
     private final GameStateRedisService redisState;
+    private final ObjectMapper objectMapper;
 
     public GameService(MatchRepository matches,
                        MatchPlayerRepository matchPlayers,
                        PlayerResourcesRepository resources,
                        PieceRepository pieces,
                        PlayerInventoryRepository inventory,
-                       GameStateRedisService redisState) {
+                       GameStateRedisService redisState,
+                       ObjectMapper objectMapper) {
         this.matches = matches;
         this.matchPlayers = matchPlayers;
         this.resources = resources;
         this.pieces = pieces;
         this.inventory = inventory;
         this.redisState = redisState;
+        this.objectMapper = objectMapper;
     }
 
     @Transactional
@@ -105,10 +140,13 @@ public class GameService {
             pr.setUserId(userId);
             // Start with 2 so players can buy a pawn immediately.
             pr.setGold(2);
+            pr.setHp(PlayerResources.DEFAULT_HP);
             pr.setLevel(PlayerResources.DEFAULT_LEVEL);
             pr.setExperience(PlayerResources.DEFAULT_EXPERIENCE);
             resources.save(pr);
             logger.debug(PLAYER_RESOURCES_INITIALIZED, m.getId(), userId);
+
+            redisState.initPlayerKing(m.getId(), userId);
         }
 
         redisState.initMatchState(m.getId());
@@ -198,7 +236,128 @@ public class GameService {
         }
         bench.sort(Comparator.comparingInt(BenchSlotResponse::slot));
 
-        return new ShopStateResponse(pr.getGold(), items, bench, boardPieces);
+        redisState.initPlayerKing(matchId, userId);
+        KingSquareResponse king = redisState.getKingSquare(matchId, userId);
+        if (king == null) {
+            throw new IllegalStateException("Could not load king position");
+        }
+
+        long shopEndsAt = redisState.ensureAndGetShopPhaseEndsAtMillis(matchId);
+
+        return new ShopStateResponse(
+                pr.getGold(),
+                pr.getHp(),
+                PlayerResources.DEFAULT_HP,
+                items,
+                bench,
+                boardPieces,
+                king,
+                shopEndsAt);
+    }
+
+    /**
+     * Persists battle round outcome: HP loss for the losing side (≈ rounded pawn eval {@code |cp|/100}), then +2
+     * pawns (gold) for White and for Black. Idempotent per match Redis shop-round.
+     */
+    @Transactional
+    public BattleRoundEvaluationResponse finalizeBattleRoundEvaluation(
+            Integer matchId,
+            int redisRound,
+            long currentUserId,
+            long whiteUserId,
+            long blackUserId,
+            String fen,
+            int centipawns,
+            String advantage,
+            List<BoardPieceResponse> whiteBoard,
+            List<BoardPieceResponse> blackBoard,
+            KingSquareResponse whiteKing,
+            KingSquareResponse blackKing,
+            List<String> principalVariation
+    ) {
+        matches.findByIdForUpdate(matchId)
+                .orElseThrow(() -> new IllegalArgumentException(ERROR_MATCH_NOT_FOUND_MESSAGE + matchId));
+
+        Optional<String> cached = redisState.getCachedBattleEval(matchId, redisRound);
+        if (cached.isPresent()) {
+            try {
+                BattleRoundEvaluationResponse parsed =
+                        objectMapper.readValue(cached.get(), BattleRoundEvaluationResponse.class);
+                return parsed.forViewer(currentUserId);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Cached battle evaluation is corrupt", e);
+            }
+        }
+
+        BattleRoundHpSnapshot hp = applyBattleRoundOutcome(matchId, whiteUserId, blackUserId, centipawns);
+
+        BattleRoundEvaluationResponse response = new BattleRoundEvaluationResponse(
+                fen,
+                centipawns,
+                advantage,
+                whiteUserId,
+                blackUserId,
+                currentUserId == whiteUserId,
+                whiteBoard,
+                blackBoard,
+                whiteKing,
+                blackKing,
+                principalVariation == null ? List.of() : principalVariation,
+                hp.whiteHp(),
+                hp.blackHp()
+        );
+
+        final String json;
+        try {
+            json = objectMapper.writeValueAsString(response);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize battle evaluation", e);
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                redisState.setCachedBattleEval(matchId, redisRound, json);
+                redisState.incrementShopRoundAfterBattle(matchId);
+            }
+        });
+
+        return response;
+    }
+
+    private BattleRoundHpSnapshot applyBattleRoundOutcome(
+            Integer matchId,
+            long whiteUserId,
+            long blackUserId,
+            int centipawns
+    ) {
+        if (centipawns != 0) {
+            long loserId = centipawns > 0 ? blackUserId : whiteUserId;
+            int damage = (int) Math.round(Math.abs(centipawns) / 100.0);
+            damage = Math.min(Math.max(0, damage), BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED);
+            PlayerResources loser = resources.findByMatchIdAndUserId(matchId, loserId)
+                    .orElseThrow(() -> new IllegalStateException("Player resources not found for loser"));
+            int before = loser.getHp();
+            loser.setHp(Math.max(0, before - damage));
+            resources.save(loser);
+            logger.info(LOG_BATTLE_HP, matchId, centipawns, loserId, damage);
+        }
+
+        for (long userId : List.of(whiteUserId, blackUserId)) {
+            PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
+                    .orElseThrow(() -> new IllegalStateException("Player resources not found"));
+            pr.setGold(pr.getGold() + BATTLE_ROUND_PAWNS_PER_SIDE);
+            resources.save(pr);
+            logger.debug(LOG_BATTLE_PAWNS, matchId, userId, BATTLE_ROUND_PAWNS_PER_SIDE);
+        }
+
+        int w = resources.findByMatchIdAndUserId(matchId, whiteUserId)
+                .map(PlayerResources::getHp)
+                .orElse(PlayerResources.DEFAULT_HP);
+        int b = resources.findByMatchIdAndUserId(matchId, blackUserId)
+                .map(PlayerResources::getHp)
+                .orElse(PlayerResources.DEFAULT_HP);
+        return new BattleRoundHpSnapshot(w, b);
     }
 
     @Transactional
@@ -243,10 +402,6 @@ public class GameService {
 
         ensurePlayerInMatch(matchId, userId);
 
-        if (req.squareX() == WHITE_KING_HOME_COL && req.squareY() == WHITE_KING_HOME_ROW) {
-            throw new IllegalStateException("That square is reserved for your king");
-        }
-
         PlayerInventory benchItem = inventory
                 .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, req.benchSlot(), BENCH_POSITION_Y)
                 .orElseThrow(() -> new IllegalArgumentException("No piece in that bench slot"));
@@ -254,6 +409,14 @@ public class GameService {
         if (benchItem.isOnBoard()) {
             throw new IllegalStateException("That bench slot is empty");
         }
+
+        Piece benchPiece = pieces.findById(benchItem.getPieceId())
+                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
+        if (isPawnPiece(benchPiece)) {
+            validatePawnSquare(req.squareX(), req.squareY());
+        }
+
+        ensureTargetNotOnKing(matchId, userId, req.squareX(), req.squareY());
 
         if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
                 matchId, userId, req.squareX(), req.squareY())) {
@@ -267,6 +430,70 @@ public class GameService {
     }
 
     @Transactional
+    public SellPieceResponse sellPiece(Integer matchId, Long userId, SellPieceRequest req) {
+        ensurePlayerInMatch(matchId, userId);
+
+        if (req.benchSlot() != null) {
+            if (req.fromX() != null || req.fromY() != null) {
+                throw new IllegalArgumentException("Use either benchSlot or board coordinates, not both");
+            }
+            return sellFromBench(matchId, userId, req.benchSlot());
+        }
+        if (req.fromX() != null && req.fromY() != null) {
+            return sellFromBoard(matchId, userId, req.fromX(), req.fromY());
+        }
+        throw new IllegalArgumentException("Specify benchSlot or both fromX and fromY");
+    }
+
+    private SellPieceResponse sellFromBench(Integer matchId, Long userId, int benchSlot) {
+        if (benchSlot < 0 || benchSlot > 7) {
+            throw new IllegalArgumentException("Invalid bench slot");
+        }
+        PlayerInventory item = inventory
+                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, benchSlot, BENCH_POSITION_Y)
+                .orElseThrow(() -> new IllegalArgumentException("No piece in that bench slot"));
+        if (item.isOnBoard()) {
+            throw new IllegalStateException("That bench slot is empty");
+        }
+        Piece pieceEntity = pieces.findById(item.getPieceId())
+                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
+        return finalizeSell(matchId, userId, item, pieceEntity);
+    }
+
+    private SellPieceResponse sellFromBoard(Integer matchId, Long userId, int fromX, int fromY) {
+        if (fromX < 0 || fromX > 7 || fromY < 0 || fromY > 7) {
+            throw new IllegalArgumentException("Square out of bounds");
+        }
+        redisState.initPlayerKing(matchId, userId);
+        KingSquareResponse king = redisState.getKingSquare(matchId, userId);
+        if (king != null && king.x() == fromX && king.y() == fromY) {
+            throw new IllegalStateException("You cannot sell your king");
+        }
+        PlayerInventory item = inventory
+                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, fromX, fromY)
+                .orElseThrow(() -> new IllegalArgumentException("No piece on that square"));
+        if (!item.isOnBoard()) {
+            throw new IllegalStateException("That square does not hold a board piece");
+        }
+        Piece pieceEntity = pieces.findById(item.getPieceId())
+                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
+        return finalizeSell(matchId, userId, item, pieceEntity);
+    }
+
+    private SellPieceResponse finalizeSell(Integer matchId, Long userId, PlayerInventory item, Piece pieceEntity) {
+        String pieceKey = normalizePieceKey(pieceEntity.getName());
+        int refund = pieceEntity.getCostGold();
+        PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
+                .orElseThrow(() -> new IllegalArgumentException("Player resources not found"));
+        int moneyBefore = pr.getGold();
+        pr.setGold(moneyBefore + refund);
+        resources.save(pr);
+        inventory.delete(item);
+        logger.info(LOG_SELL_PIECE, matchId, userId, pieceKey, refund);
+        return new SellPieceResponse(pieceKey, moneyBefore, pr.getGold());
+    }
+
+    @Transactional
     public void moveBoardPiece(Integer matchId, Long userId, MovePieceRequest req) {
         logger.info(LOG_MOVE_PIECE, matchId, userId, req.fromX(), req.fromY(), req.toX(), req.toY());
 
@@ -274,10 +501,6 @@ public class GameService {
 
         if (req.fromX().equals(req.toX()) && req.fromY().equals(req.toY())) {
             return;
-        }
-
-        if (req.toX() == WHITE_KING_HOME_COL && req.toY() == WHITE_KING_HOME_ROW) {
-            throw new IllegalStateException("That square is reserved for your king");
         }
 
         PlayerInventory piece = inventory
@@ -288,6 +511,14 @@ public class GameService {
             throw new IllegalArgumentException("That square does not hold a board piece");
         }
 
+        Piece pieceEntity = pieces.findById(piece.getPieceId())
+                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
+        if (isPawnPiece(pieceEntity)) {
+            validatePawnSquare(req.toX(), req.toY());
+        }
+
+        ensureTargetNotOnKing(matchId, userId, req.toX(), req.toY());
+
         if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
                 matchId, userId, req.toX(), req.toY())) {
             throw new IllegalStateException("That square is already occupied");
@@ -296,6 +527,64 @@ public class GameService {
         piece.setPositionX(req.toX());
         piece.setPositionY(req.toY());
         inventory.save(piece);
+    }
+
+    @Transactional
+    public void moveKing(Integer matchId, Long userId, MoveKingRequest req) {
+        ensurePlayerInMatch(matchId, userId);
+        validateKingLane(req.toX());
+        validateKingRank(req.toY());
+
+        redisState.initPlayerKing(matchId, userId);
+        KingSquareResponse current = redisState.getKingSquare(matchId, userId);
+        if (current == null) {
+            throw new IllegalStateException("King position not available");
+        }
+        if (current.x() == req.toX() && current.y() == req.toY()) {
+            return;
+        }
+
+        ensureTargetNotOccupiedByPiece(matchId, userId, req.toX(), req.toY());
+
+        redisState.setKingSquare(matchId, userId, req.toX(), req.toY());
+    }
+
+    private void validateKingLane(int col) {
+        if (col < KING_LANE_MIN_COL || col > KING_LANE_MAX_COL) {
+            throw new IllegalStateException("Your king move is out of board bounds");
+        }
+    }
+
+    private void validateKingRank(int row) {
+        if (row < KING_RANK_MIN_ROW || row > KING_RANK_MAX_ROW) {
+            throw new IllegalStateException("Your king may only be on ranks 1–4");
+        }
+    }
+
+    private void validatePawnSquare(int file, int row) {
+        if (row < PAWN_RANK_MIN_ROW || row > PAWN_RANK_MAX_ROW) {
+            throw new IllegalStateException("Pawns may only be on ranks 2–4");
+        }
+    }
+
+    private boolean isPawnPiece(Piece piece) {
+        return "pawn".equals(normalizePieceKey(piece.getName()));
+    }
+
+    private void ensureTargetNotOnKing(Integer matchId, Long userId, int x, int y) {
+        redisState.initPlayerKing(matchId, userId);
+        KingSquareResponse king = redisState.getKingSquare(matchId, userId);
+        if (king != null && king.x() == x && king.y() == y) {
+            throw new IllegalStateException("That square is occupied by your king");
+        }
+    }
+
+    /** King tile may stack visually only on empty squares for pieces. */
+    private void ensureTargetNotOccupiedByPiece(Integer matchId, Long userId, int x, int y) {
+        if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
+                matchId, userId, x, y)) {
+            throw new IllegalStateException("That square is already occupied");
+        }
     }
 
     private void ensurePlayerInMatch(Integer matchId, Long userId) {
