@@ -93,6 +93,12 @@ public class GameService {
     private static final int BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED = 25;
     /** Each side receives this many pawns (gold) when a battle round is resolved. */
     private static final int BATTLE_ROUND_PAWNS_PER_SIDE = 2;
+    /** Shared battle presentation window so both clients can replay and transition in lockstep. */
+    private static final long BATTLE_VIEW_BASE_DELAY_MS = 50L;
+    private static final long BATTLE_VIEW_STEP_MS = 1000L;
+    private static final long BATTLE_VIEW_END_PAUSE_MS = 2500L;
+    private static final int BATTLE_VIEW_MAX_PLIES = 20;
+    private static final long BATTLE_VIEW_SAFETY_BUFFER_MS = 750L;
 
     private final MatchRepository matches;
     private final MatchPlayerRepository matchPlayers;
@@ -303,6 +309,7 @@ public class GameService {
                 whiteKing,
                 blackKing,
                 principalVariation == null ? List.of() : principalVariation,
+                computeBattleViewEndsAtEpochMs(principalVariation == null ? List.of() : principalVariation),
                 hp.whiteHp(),
                 hp.blackHp()
         );
@@ -318,6 +325,7 @@ public class GameService {
             @Override
             public void afterCommit() {
                 redisState.setCachedBattleEval(matchId, redisRound, json);
+                redisState.setLastBattleEval(matchId, redisRound, json);
                 redisState.incrementShopRoundAfterBattle(matchId);
             }
         });
@@ -358,6 +366,12 @@ public class GameService {
                 .map(PlayerResources::getHp)
                 .orElse(PlayerResources.DEFAULT_HP);
         return new BattleRoundHpSnapshot(w, b);
+    }
+
+    private long computeBattleViewEndsAtEpochMs(List<String> principalVariation) {
+        int plies = Math.min(BATTLE_VIEW_MAX_PLIES, principalVariation.size());
+        long replayMs = BATTLE_VIEW_BASE_DELAY_MS + (plies * BATTLE_VIEW_STEP_MS) + BATTLE_VIEW_END_PAUSE_MS;
+        return System.currentTimeMillis() + replayMs + BATTLE_VIEW_SAFETY_BUFFER_MS;
     }
 
     @Transactional

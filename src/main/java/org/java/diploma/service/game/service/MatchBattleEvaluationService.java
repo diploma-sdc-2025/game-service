@@ -94,7 +94,9 @@ public class MatchBattleEvaluationService {
             try {
                 BattleRoundEvaluationResponse parsed =
                         objectMapper.readValue(cached.get(), BattleRoundEvaluationResponse.class);
-                return parsed.forViewer(currentUserId);
+                BattleRoundEvaluationResponse out = parsed.forViewer(currentUserId);
+                redisState.markBattleViewedByUser(matchId, redisRound, currentUserId);
+                return out;
             } catch (JsonProcessingException e) {
                 throw new IllegalStateException("Cached battle evaluation is corrupt", e);
             }
@@ -102,7 +104,7 @@ public class MatchBattleEvaluationService {
 
         BattleEngineEvaluateResponse engine = callBattleEvaluate(fen);
 
-        return gameService.finalizeBattleRoundEvaluation(
+        BattleRoundEvaluationResponse out = gameService.finalizeBattleRoundEvaluation(
                 matchId,
                 redisRound,
                 currentUserId,
@@ -117,6 +119,8 @@ public class MatchBattleEvaluationService {
                 blackKing,
                 engine.principalVariation()
         );
+        redisState.markBattleViewedByUser(matchId, redisRound, currentUserId);
+        return out;
     }
 
     private BattleEngineEvaluateResponse callBattleEvaluate(String fen) {

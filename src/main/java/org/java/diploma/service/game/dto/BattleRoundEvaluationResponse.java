@@ -14,6 +14,7 @@ public record BattleRoundEvaluationResponse(
         KingSquareResponse whiteKing,
         KingSquareResponse blackKing,
         List<String> principalVariation,
+        long battleViewEndsAt,
         int whiteHp,
         int blackHp
 ) {
@@ -33,6 +34,7 @@ public record BattleRoundEvaluationResponse(
                 whiteKing,
                 blackKing,
                 principalVariation,
+                battleViewEndsAt,
                 whiteHp,
                 blackHp
         );

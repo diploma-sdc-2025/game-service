@@ -22,6 +22,13 @@ public class GameStateRedisService {
     private static final String REDIS_KEY_PREFIX_KING = "game:king:";
     /** v2: per-cycle round is advanced after each battle so keys rotate with new shop setups. */
     private static final String REDIS_KEY_PREFIX_BATTLE_EVAL = "game:battleEval:v2:";
+    /**
+     * Single-slot "last battle" snapshot used as a safety net when one client is late and the round already
+     * advanced. Prevents a player from silently missing battle and continuing shopping.
+     */
+    private static final String REDIS_KEY_LAST_BATTLE_EVAL = "game:lastBattleEval:v1:";
+    private static final String REDIS_KEY_LAST_BATTLE_ROUND = "game:lastBattleRound:v1:";
+    private static final String REDIS_KEY_BATTLE_VIEWED_PREFIX = "game:battleViewed:v1:";
     private static final String REDIS_KEY_SHOP_PHASE_ENDS = "game:shopPhaseEndsAt:";
     private static final String REDIS_KEY_SHOP_TIMER_ROUND = "game:shopTimerRound:";
 
@@ -215,8 +222,49 @@ public class GameStateRedisService {
         stringRedis.opsForValue().set(battleEvalKey(matchId, round), json, BATTLE_EVAL_CACHE_TTL);
     }
 
+    public void setLastBattleEval(long matchId, int round, String json) {
+        stringRedis.opsForValue().set(lastBattleEvalKey(matchId), json, BATTLE_EVAL_CACHE_TTL);
+        stringRedis.opsForValue().set(lastBattleRoundKey(matchId), Integer.toString(round), BATTLE_EVAL_CACHE_TTL);
+    }
+
+    public Optional<LastBattleEval> getLastBattleEval(long matchId) {
+        String roundStr = stringRedis.opsForValue().get(lastBattleRoundKey(matchId));
+        String json = stringRedis.opsForValue().get(lastBattleEvalKey(matchId));
+        if (roundStr == null || json == null) {
+            return Optional.empty();
+        }
+        try {
+            int round = Integer.parseInt(roundStr);
+            return Optional.of(new LastBattleEval(round, json));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
+    }
+
+    public boolean hasBattleBeenViewedByUser(long matchId, int round, long userId) {
+        return Boolean.TRUE.equals(stringRedis.opsForSet().isMember(battleViewedKey(matchId, round), Long.toString(userId)));
+    }
+
+    public void markBattleViewedByUser(long matchId, int round, long userId) {
+        String key = battleViewedKey(matchId, round);
+        stringRedis.opsForSet().add(key, Long.toString(userId));
+        stringRedis.expire(key, BATTLE_EVAL_CACHE_TTL);
+    }
+
     private String battleEvalKey(long matchId, int round) {
         return REDIS_KEY_PREFIX_BATTLE_EVAL + matchId + ":" + round;
+    }
+
+    private String lastBattleEvalKey(long matchId) {
+        return REDIS_KEY_LAST_BATTLE_EVAL + matchId;
+    }
+
+    private String lastBattleRoundKey(long matchId) {
+        return REDIS_KEY_LAST_BATTLE_ROUND + matchId;
+    }
+
+    private String battleViewedKey(long matchId, int round) {
+        return REDIS_KEY_BATTLE_VIEWED_PREFIX + matchId + ":" + round;
     }
 
     private String stateKey(long matchId) {
@@ -230,4 +278,6 @@ public class GameStateRedisService {
     private String kingKey(long matchId, long userId) {
         return REDIS_KEY_PREFIX_KING + matchId + ":" + userId;
     }
+
+    public record LastBattleEval(int round, String json) {}
 }
