@@ -39,7 +39,7 @@ class GameControllerTest {
     @Test
     void createMatch_delegatesToService() {
         CreateMatchRequest req = new CreateMatchRequest(List.of(1L, 2L));
-        MatchResponse expected = new MatchResponse(100, "WAITING", 1, List.of(1L, 2L));
+        MatchResponse expected = new MatchResponse(100, "WAITING", 1, List.of(1L, 2L), null);
         when(game.createMatch(req)).thenReturn(expected);
 
         MatchResponse response = controller.createMatch(req);
@@ -49,7 +49,7 @@ class GameControllerTest {
 
     @Test
     void getMatch_delegatesToService() {
-        MatchResponse expected = new MatchResponse(7, "WAITING", 1, List.of(10L, 20L));
+        MatchResponse expected = new MatchResponse(7, "WAITING", 1, List.of(10L, 20L), null);
         when(game.getMatch(7)).thenReturn(expected);
 
         assertThat(controller.getMatch(7)).isEqualTo(expected);
@@ -172,7 +172,9 @@ class GameControllerTest {
                 List.of("e2e4"),
                 100L,
                 99,
-                98
+                98,
+                false,
+                null
         );
         when(battleEvaluation.evaluateRound(1, 11L)).thenReturn(expected);
 
@@ -193,15 +195,23 @@ class GameControllerTest {
     @Test
     void authenticatedUserIsRequired() {
         assertThatThrownBy(() -> controller.getShop(1, null))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Missing authenticated user");
+                .isInstanceOf(ResponseStatusException.class)
+                .satisfies(ex -> {
+                    ResponseStatusException rse = (ResponseStatusException) ex;
+                    assertThat(rse.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    assertThat(rse.getReason()).contains("Missing authenticated user");
+                });
     }
 
     @Test
     void authenticatedUserIdMustBeNumeric() {
         assertThatThrownBy(() -> controller.getShop(1, auth("abc")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Invalid user id");
+                .isInstanceOf(ResponseStatusException.class)
+                .satisfies(ex -> {
+                    ResponseStatusException rse = (ResponseStatusException) ex;
+                    assertThat(rse.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    assertThat(rse.getReason()).contains("Invalid user id");
+                });
     }
 
     private Authentication auth(String name) {

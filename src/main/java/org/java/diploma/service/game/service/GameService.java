@@ -2,6 +2,7 @@ package org.java.diploma.service.game.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.java.diploma.service.game.analytics.AnalyticsEventPublisher;
 import org.java.diploma.service.game.dto.BattleRoundEvaluationResponse;
 import org.java.diploma.service.game.dto.BattleRoundHpSnapshot;
 import org.java.diploma.service.game.dto.BenchSlotResponse;
@@ -35,8 +36,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -87,10 +90,10 @@ public class GameService {
     private static final String LOG_BATTLE_PAWNS = "Battle round pawn income: matchId={}, userId={}, +{}";
 
     /**
-     * Max HP removed per round after converting eval to pawns ({@code round(|cp|/100)}). Prevents one-shot wipes
-     * from extreme engine scores while matching the eval bar scale (e.g. 5.7 pawns → ~6 HP, not 10).
+     * Max HP removed per round after converting eval to pawns ({@code round(|cp|/100)}). The eval bar can still
+     * show higher advantages; actual HP loss is capped here (currently 10 per round).
      */
-    private static final int BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED = 25;
+    private static final int BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED = 10;
     /** Each side receives this many pawns (gold) when a battle round is resolved. */
     private static final int BATTLE_ROUND_PAWNS_PER_SIDE = 2;
     /** Shared battle presentation window so both clients can replay and transition in lockstep. */
@@ -107,6 +110,8 @@ public class GameService {
     private final PlayerInventoryRepository inventory;
     private final GameStateRedisService redisState;
     private final ObjectMapper objectMapper;
+    private final AnalyticsEventPublisher analyticsEventPublisher;
+    private final MatchRatingNotifier matchRatingNotifier;
 
     public GameService(MatchRepository matches,
                        MatchPlayerRepository matchPlayers,
@@ -114,7 +119,9 @@ public class GameService {
                        PieceRepository pieces,
                        PlayerInventoryRepository inventory,
                        GameStateRedisService redisState,
-                       ObjectMapper objectMapper) {
+                       ObjectMapper objectMapper,
+                       AnalyticsEventPublisher analyticsEventPublisher,
+                       MatchRatingNotifier matchRatingNotifier) {
         this.matches = matches;
         this.matchPlayers = matchPlayers;
         this.resources = resources;
@@ -122,6 +129,8 @@ public class GameService {
         this.inventory = inventory;
         this.redisState = redisState;
         this.objectMapper = objectMapper;
+        this.analyticsEventPublisher = analyticsEventPublisher;
+        this.matchRatingNotifier = matchRatingNotifier;
     }
 
     @Transactional
@@ -129,7 +138,12 @@ public class GameService {
         logger.info(LOG_CREATING_MATCH, req.playerIds().size());
 
         Match m = new Match();
+        // Matchmaking pairs two ready players, so a match is immediately playable on creation —
+        // there is no real WAITING period. Marking it IN_PROGRESS here means subsequent buy/move
+        // requests pass ensureMatchInProgress without needing a separate /start call.
         m.setStatus(Match.STATUS_WAITING);
+        m = matches.save(m);
+        m.start();
         m = matches.save(m);
 
         logger.info(MATCH_CREATED, m.getId(), req.playerIds().size());
@@ -152,13 +166,19 @@ public class GameService {
             resources.save(pr);
             logger.debug(PLAYER_RESOURCES_INITIALIZED, m.getId(), userId);
 
+            redisState.initPlayerResourcesIfAbsent(m.getId(), userId, pr.getGold(), pr.getHp());
             redisState.initPlayerKing(m.getId(), userId);
         }
 
         redisState.initMatchState(m.getId());
         logger.info(MATCH_STATE_INITIALIZED, m.getId());
 
-        return new MatchResponse(m.getId(), m.getStatus(), m.getCurrentRound(), req.playerIds());
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("playerCount", req.playerIds().size());
+        Long firstPlayer = req.playerIds().isEmpty() ? null : req.playerIds().get(0);
+        analyticsEventPublisher.publish("match_started", firstPlayer, (long) m.getId(), meta);
+
+        return new MatchResponse(m.getId(), m.getStatus(), m.getCurrentRound(), req.playerIds(), null);
     }
 
     @Transactional(readOnly = true)
@@ -175,7 +195,7 @@ public class GameService {
                 .stream().map(MatchPlayer::getUserId).toList();
 
         logger.debug(MATCH_RETRIEVED, matchId);
-        return new MatchResponse(m.getId(), m.getStatus(), m.getCurrentRound(), players);
+        return new MatchResponse(m.getId(), m.getStatus(), m.getCurrentRound(), players, m.getWinnerId());
     }
 
     @Transactional
@@ -192,55 +212,49 @@ public class GameService {
         matches.save(m);
 
         logger.info(MATCH_STARTED, matchId);
+
+        List<Long> players = matchPlayers.findAllByMatchId(matchId)
+                .stream().map(MatchPlayer::getUserId).toList();
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("playerCount", players.size());
+        Long firstPlayer = players.isEmpty() ? null : players.get(0);
+        analyticsEventPublisher.publish("match_started", firstPlayer, (long) matchId, meta);
     }
 
     @Transactional(readOnly = true)
     public ShopStateResponse getShopState(Integer matchId, Long userId) {
         logger.debug(LOG_GET_SHOP, matchId, userId);
         ensurePlayerInMatch(matchId, userId);
+        // Allow reads after FINISHED so clients can refresh UI without 409; mutations still call ensureMatchInProgress.
 
         PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
                 .orElseThrow(() -> new IllegalArgumentException("Player resources not found"));
+        redisState.initPlayerResourcesIfAbsent(matchId, userId, pr.getGold(), pr.getHp());
+        int runtimeGold = redisState.getPlayerGold(matchId, userId, pr.getGold());
+        int runtimeHp = redisState.getPlayerHp(matchId, userId, pr.getHp());
 
         Map<String, Integer> ownedCounts = new LinkedHashMap<>();
-        for (PlayerInventory item : inventory.findAllByMatchIdAndUserId(matchId, userId)) {
-            Optional<Piece> p = pieces.findById(item.getPieceId());
-            p.ifPresent(piece -> {
-                String key = normalizePieceKey(piece.getName());
-                ownedCounts.put(key, ownedCounts.getOrDefault(key, 0) + 1);
-            });
+        List<String> order = List.of("pawn", "knight", "bishop", "rook", "queen");
+        List<BenchSlotResponse> bench = getOrSeedRuntimeBench(matchId, userId);
+        for (BenchSlotResponse b : bench) {
+            ownedCounts.put(b.piece(), ownedCounts.getOrDefault(b.piece(), 0) + 1);
+        }
+        List<BoardPieceResponse> boardPiecesFromDb = loadBoardPiecesFromDb(matchId, userId);
+        List<BoardPieceResponse> boardPieces = getOrSeedRuntimeBoard(matchId, userId, boardPiecesFromDb);
+        for (BoardPieceResponse b : boardPieces) {
+            ownedCounts.put(b.piece(), ownedCounts.getOrDefault(b.piece(), 0) + 1);
         }
 
-        List<String> order = List.of("pawn", "knight", "bishop", "rook", "queen");
+        final int goldForShop = runtimeGold;
         List<ShopItemResponse> items = order.stream().map(piece -> {
             int cost = resolvePieceCost(piece);
             return new ShopItemResponse(
                     piece,
                     cost,
-                    pr.getGold() >= cost,
+                    goldForShop >= cost,
                     ownedCounts.getOrDefault(piece, 0)
             );
         }).toList();
-
-        List<BenchSlotResponse> bench = new ArrayList<>();
-        List<BoardPieceResponse> boardPieces = new ArrayList<>();
-        for (PlayerInventory item : inventory.findAllByMatchIdAndUserId(matchId, userId)) {
-            Optional<Piece> pieceOpt = pieces.findById(item.getPieceId());
-            if (item.isOnBoard()) {
-                pieceOpt.ifPresent(pieceEntity -> boardPieces.add(new BoardPieceResponse(
-                        item.getPositionX(),
-                        item.getPositionY(),
-                        normalizePieceKey(pieceEntity.getName()))));
-                continue;
-            }
-            if (item.getPositionY() != BENCH_POSITION_Y) {
-                continue;
-            }
-            pieceOpt.ifPresent(pieceEntity -> bench.add(new BenchSlotResponse(
-                    item.getPositionX(),
-                    normalizePieceKey(pieceEntity.getName()))));
-        }
-        bench.sort(Comparator.comparingInt(BenchSlotResponse::slot));
 
         redisState.initPlayerKing(matchId, userId);
         KingSquareResponse king = redisState.getKingSquare(matchId, userId);
@@ -251,8 +265,8 @@ public class GameService {
         long shopEndsAt = redisState.ensureAndGetShopPhaseEndsAtMillis(matchId);
 
         return new ShopStateResponse(
-                pr.getGold(),
-                pr.getHp(),
+                runtimeGold,
+                runtimeHp,
                 PlayerResources.DEFAULT_HP,
                 items,
                 bench,
@@ -281,7 +295,7 @@ public class GameService {
             KingSquareResponse blackKing,
             List<String> principalVariation
     ) {
-        matches.findByIdForUpdate(matchId)
+        Match matchLocked = matches.findByIdForUpdate(matchId)
                 .orElseThrow(() -> new IllegalArgumentException(ERROR_MATCH_NOT_FOUND_MESSAGE + matchId));
 
         Optional<String> cached = redisState.getCachedBattleEval(matchId, redisRound);
@@ -295,7 +309,52 @@ public class GameService {
             }
         }
 
-        BattleRoundHpSnapshot hp = applyBattleRoundOutcome(matchId, whiteUserId, blackUserId, centipawns);
+        boolean firstApplier = redisState.tryMarkBattleRoundApplied(matchId, redisRound);
+        if (!firstApplier) {
+            BattleRoundEvaluationResponse existing = awaitCachedBattleEval(matchId, redisRound);
+            if (existing != null) {
+                return existing.forViewer(currentUserId);
+            }
+            // Last-resort fallback: avoid double rewards even if cache isn't visible yet.
+            // Build a viewer response with current runtime HP snapshot.
+            PlayerResources whiteDb = resources.findByMatchIdAndUserId(matchId, whiteUserId)
+                    .orElseThrow(() -> new IllegalStateException("Player resources not found"));
+            PlayerResources blackDb = resources.findByMatchIdAndUserId(matchId, blackUserId)
+                    .orElseThrow(() -> new IllegalStateException("Player resources not found"));
+            int whiteHpNow = redisState.getPlayerHp(matchId, whiteUserId, whiteDb.getHp());
+            int blackHpNow = redisState.getPlayerHp(matchId, blackUserId, blackDb.getHp());
+            Match statusMatch = matches.findById(matchId)
+                    .orElseThrow(() -> new IllegalArgumentException(ERROR_MATCH_NOT_FOUND_MESSAGE + matchId));
+            boolean matchFinished = statusMatch.isFinished();
+            Long winnerUserId = matchFinished ? statusMatch.getWinnerId() : null;
+            BattleRoundEvaluationResponse fallback = new BattleRoundEvaluationResponse(
+                    fen,
+                    centipawns,
+                    advantage,
+                    whiteUserId,
+                    blackUserId,
+                    currentUserId == whiteUserId,
+                    whiteBoard,
+                    blackBoard,
+                    whiteKing,
+                    blackKing,
+                    principalVariation == null ? List.of() : principalVariation,
+                    computeBattleViewEndsAtEpochMs(principalVariation == null ? List.of() : principalVariation),
+                    whiteHpNow,
+                    blackHpNow,
+                    matchFinished,
+                    winnerUserId
+            );
+            return fallback.forViewer(currentUserId);
+        }
+
+        if (!matchLocked.isInProgress()) {
+            throw new IllegalStateException("This match has ended");
+        }
+
+        AppliedBattleOutcome applied = applyBattleRoundOutcome(
+                matchLocked, matchId, whiteUserId, blackUserId, centipawns);
+        persistRuntimeShopStateToDatabase(matchId);
 
         BattleRoundEvaluationResponse response = new BattleRoundEvaluationResponse(
                 fen,
@@ -310,8 +369,10 @@ public class GameService {
                 blackKing,
                 principalVariation == null ? List.of() : principalVariation,
                 computeBattleViewEndsAtEpochMs(principalVariation == null ? List.of() : principalVariation),
-                hp.whiteHp(),
-                hp.blackHp()
+                applied.hp().whiteHp(),
+                applied.hp().blackHp(),
+                applied.matchFinished(),
+                applied.winnerUserId()
         );
 
         final String json;
@@ -326,46 +387,118 @@ public class GameService {
             public void afterCommit() {
                 redisState.setCachedBattleEval(matchId, redisRound, json);
                 redisState.setLastBattleEval(matchId, redisRound, json);
-                redisState.incrementShopRoundAfterBattle(matchId);
+                long shopEndsAtEpochMs =
+                        response.battleViewEndsAt()
+                                + Duration.ofSeconds(GameStateRedisService.SHOP_PHASE_DURATION_SECONDS)
+                                        .toMillis();
+                redisState.incrementShopRoundAfterBattle(matchId, shopEndsAtEpochMs);
+                if (applied.matchFinished()
+                        && applied.winnerUserId() != null
+                        && applied.loserUserId() != null) {
+                    matchRatingNotifier.notifyMatchFinished(applied.winnerUserId(), applied.loserUserId());
+                }
             }
         });
 
         return response;
     }
 
-    private BattleRoundHpSnapshot applyBattleRoundOutcome(
+    private BattleRoundEvaluationResponse awaitCachedBattleEval(Integer matchId, int redisRound) {
+        long deadline = System.currentTimeMillis() + 1500L;
+        while (System.currentTimeMillis() < deadline) {
+            Optional<String> cached = redisState.getCachedBattleEval(matchId, redisRound);
+            if (cached.isPresent()) {
+                try {
+                    return objectMapper.readValue(cached.get(), BattleRoundEvaluationResponse.class);
+                } catch (JsonProcessingException ignored) {
+                    return null;
+                }
+            }
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private record AppliedBattleOutcome(
+            BattleRoundHpSnapshot hp,
+            boolean matchFinished,
+            Long winnerUserId,
+            Long loserUserId
+    ) {}
+
+    private AppliedBattleOutcome applyBattleRoundOutcome(
+            Match matchRow,
             Integer matchId,
             long whiteUserId,
             long blackUserId,
             int centipawns
     ) {
+        PlayerResources whiteDb = resources.findByMatchIdAndUserId(matchId, whiteUserId)
+                .orElseThrow(() -> new IllegalStateException("Player resources not found"));
+        PlayerResources blackDb = resources.findByMatchIdAndUserId(matchId, blackUserId)
+                .orElseThrow(() -> new IllegalStateException("Player resources not found"));
+        redisState.initPlayerResourcesIfAbsent(matchId, whiteUserId, whiteDb.getGold(), whiteDb.getHp());
+        redisState.initPlayerResourcesIfAbsent(matchId, blackUserId, blackDb.getGold(), blackDb.getHp());
+
+        int whiteHp = redisState.getPlayerHp(matchId, whiteUserId, whiteDb.getHp());
+        int blackHp = redisState.getPlayerHp(matchId, blackUserId, blackDb.getHp());
+        int whiteGold = redisState.getPlayerGold(matchId, whiteUserId, whiteDb.getGold());
+        int blackGold = redisState.getPlayerGold(matchId, blackUserId, blackDb.getGold());
+
+        long loserId = 0L;
+        long winnerId = 0L;
+        boolean justEliminated = false;
         if (centipawns != 0) {
-            long loserId = centipawns > 0 ? blackUserId : whiteUserId;
+            loserId = centipawns > 0 ? blackUserId : whiteUserId;
+            winnerId = loserId == whiteUserId ? blackUserId : whiteUserId;
+            int loserHpBefore = loserId == whiteUserId ? whiteHp : blackHp;
             int damage = (int) Math.round(Math.abs(centipawns) / 100.0);
             damage = Math.min(Math.max(0, damage), BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED);
-            PlayerResources loser = resources.findByMatchIdAndUserId(matchId, loserId)
-                    .orElseThrow(() -> new IllegalStateException("Player resources not found for loser"));
-            int before = loser.getHp();
-            loser.setHp(Math.max(0, before - damage));
-            resources.save(loser);
+            int loserHpAfter = Math.max(0, loserHpBefore - damage);
+            if (loserId == whiteUserId) {
+                whiteHp = loserHpAfter;
+            } else {
+                blackHp = loserHpAfter;
+            }
+            justEliminated = loserHpBefore > 0 && loserHpAfter == 0;
             logger.info(LOG_BATTLE_HP, matchId, centipawns, loserId, damage);
         }
 
-        for (long userId : List.of(whiteUserId, blackUserId)) {
-            PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
-                    .orElseThrow(() -> new IllegalStateException("Player resources not found"));
-            pr.setGold(pr.getGold() + BATTLE_ROUND_PAWNS_PER_SIDE);
-            resources.save(pr);
-            logger.debug(LOG_BATTLE_PAWNS, matchId, userId, BATTLE_ROUND_PAWNS_PER_SIDE);
+        whiteGold += BATTLE_ROUND_PAWNS_PER_SIDE;
+        blackGold += BATTLE_ROUND_PAWNS_PER_SIDE;
+        redisState.setPlayerGold(matchId, whiteUserId, whiteGold);
+        redisState.setPlayerGold(matchId, blackUserId, blackGold);
+        redisState.setPlayerHp(matchId, whiteUserId, whiteHp);
+        redisState.setPlayerHp(matchId, blackUserId, blackHp);
+        logger.debug(LOG_BATTLE_PAWNS, matchId, whiteUserId, BATTLE_ROUND_PAWNS_PER_SIDE);
+        logger.debug(LOG_BATTLE_PAWNS, matchId, blackUserId, BATTLE_ROUND_PAWNS_PER_SIDE);
+
+        Map<String, Object> battleMeta = new HashMap<>();
+        battleMeta.put("centipawns", centipawns);
+        battleMeta.put("whiteHp", whiteHp);
+        battleMeta.put("blackHp", blackHp);
+        analyticsEventPublisher.publish("battle_round", whiteUserId, (long) matchId, battleMeta);
+
+        if (justEliminated) {
+            matchRow.finish(winnerId);
+            matches.save(matchRow);
+            Map<String, Object> finishMeta = new HashMap<>();
+            finishMeta.put("winnerUserId", winnerId);
+            finishMeta.put("loserUserId", loserId);
+            analyticsEventPublisher.publish("match_finished", winnerId, (long) matchId, finishMeta);
         }
 
-        int w = resources.findByMatchIdAndUserId(matchId, whiteUserId)
-                .map(PlayerResources::getHp)
-                .orElse(PlayerResources.DEFAULT_HP);
-        int b = resources.findByMatchIdAndUserId(matchId, blackUserId)
-                .map(PlayerResources::getHp)
-                .orElse(PlayerResources.DEFAULT_HP);
-        return new BattleRoundHpSnapshot(w, b);
+        return new AppliedBattleOutcome(
+                new BattleRoundHpSnapshot(whiteHp, blackHp),
+                justEliminated,
+                justEliminated ? winnerId : null,
+                justEliminated ? loserId : null
+        );
     }
 
     private long computeBattleViewEndsAtEpochMs(List<String> principalVariation) {
@@ -380,34 +513,33 @@ public class GameService {
         logger.info(LOG_BUY_PIECE, matchId, userId, pieceKey);
 
         ensurePlayerInMatch(matchId, userId);
+        ensureMatchInProgress(matchId);
         Piece piece = findPieceEntity(pieceKey);
         PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
                 .orElseThrow(() -> new IllegalArgumentException("Player resources not found"));
+        redisState.initPlayerResourcesIfAbsent(matchId, userId, pr.getGold(), pr.getHp());
 
         int cost = piece.getCostGold();
-        int moneyBefore = pr.getGold();
+        int moneyBefore = redisState.getPlayerGold(matchId, userId, pr.getGold());
         if (moneyBefore < cost) {
             throw new IllegalStateException("Not enough pawns to buy this piece");
         }
 
         int slot = req.slot() != null ? req.slot() : findFirstFreeBenchSlot(matchId, userId);
-        if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, slot, BENCH_POSITION_Y)) {
+        if (redisState.isBenchSlotOccupied(matchId, userId, slot)) {
             throw new IllegalStateException("Bench slot is already occupied");
         }
 
-        pr.setGold(moneyBefore - cost);
-        resources.save(pr);
+        int moneyAfter = moneyBefore - cost;
+        redisState.setPlayerGold(matchId, userId, moneyAfter);
+        redisState.setBenchSlot(matchId, userId, slot, pieceKey);
 
-        PlayerInventory item = new PlayerInventory();
-        item.setMatchId(matchId);
-        item.setUserId(userId);
-        item.setPieceId(piece.getId());
-        item.setPositionX(slot);
-        item.setPositionY(BENCH_POSITION_Y);
-        item.setOnBoard(false);
-        inventory.save(item);
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("piece", pieceKey);
+        meta.put("cost", cost);
+        analyticsEventPublisher.publish("piece_purchased", userId, (long) matchId, meta);
 
-        return new BuyPieceResponse(pieceKey, moneyBefore, pr.getGold(), slot);
+        return new BuyPieceResponse(pieceKey, moneyBefore, moneyAfter, slot);
     }
 
     @Transactional
@@ -415,37 +547,30 @@ public class GameService {
         logger.info(LOG_PLACE_PIECE, matchId, userId, req.benchSlot(), req.squareX(), req.squareY());
 
         ensurePlayerInMatch(matchId, userId);
+        ensureMatchInProgress(matchId);
 
-        PlayerInventory benchItem = inventory
-                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, req.benchSlot(), BENCH_POSITION_Y)
-                .orElseThrow(() -> new IllegalArgumentException("No piece in that bench slot"));
-
-        if (benchItem.isOnBoard()) {
+        String benchPieceKey = redisState.getBenchSlotPieceKey(matchId, userId, req.benchSlot());
+        if (benchPieceKey == null || benchPieceKey.isBlank()) {
             throw new IllegalStateException("That bench slot is empty");
         }
-
-        Piece benchPiece = pieces.findById(benchItem.getPieceId())
-                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
-        if (isPawnPiece(benchPiece)) {
+        if ("pawn".equals(benchPieceKey)) {
             validatePawnSquare(req.squareX(), req.squareY());
         }
 
         ensureTargetNotOnKing(matchId, userId, req.squareX(), req.squareY());
 
-        if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
-                matchId, userId, req.squareX(), req.squareY())) {
+        if (redisState.isPlayerBoardSquareOccupied(matchId, userId, req.squareX(), req.squareY())) {
             throw new IllegalStateException("That square is already occupied");
         }
 
-        benchItem.setPositionX(req.squareX());
-        benchItem.setPositionY(req.squareY());
-        benchItem.setOnBoard(true);
-        inventory.save(benchItem);
+        redisState.clearBenchSlot(matchId, userId, req.benchSlot());
+        redisState.setPlayerBoardSquare(matchId, userId, req.squareX(), req.squareY(), benchPieceKey);
     }
 
     @Transactional
     public SellPieceResponse sellPiece(Integer matchId, Long userId, SellPieceRequest req) {
         ensurePlayerInMatch(matchId, userId);
+        ensureMatchInProgress(matchId);
 
         if (req.benchSlot() != null) {
             if (req.fromX() != null || req.fromY() != null) {
@@ -463,15 +588,11 @@ public class GameService {
         if (benchSlot < 0 || benchSlot > 7) {
             throw new IllegalArgumentException("Invalid bench slot");
         }
-        PlayerInventory item = inventory
-                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, benchSlot, BENCH_POSITION_Y)
-                .orElseThrow(() -> new IllegalArgumentException("No piece in that bench slot"));
-        if (item.isOnBoard()) {
+        String pieceKey = redisState.getBenchSlotPieceKey(matchId, userId, benchSlot);
+        if (pieceKey == null || pieceKey.isBlank()) {
             throw new IllegalStateException("That bench slot is empty");
         }
-        Piece pieceEntity = pieces.findById(item.getPieceId())
-                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
-        return finalizeSell(matchId, userId, item, pieceEntity);
+        return finalizeSell(matchId, userId, pieceKey, false, benchSlot, null, null);
     }
 
     private SellPieceResponse sellFromBoard(Integer matchId, Long userId, int fromX, int fromY) {
@@ -483,28 +604,36 @@ public class GameService {
         if (king != null && king.x() == fromX && king.y() == fromY) {
             throw new IllegalStateException("You cannot sell your king");
         }
-        PlayerInventory item = inventory
-                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, fromX, fromY)
-                .orElseThrow(() -> new IllegalArgumentException("No piece on that square"));
-        if (!item.isOnBoard()) {
+        String pieceKey = redisState.getPlayerBoardPieceKey(matchId, userId, fromX, fromY);
+        if (pieceKey == null || pieceKey.isBlank()) {
             throw new IllegalStateException("That square does not hold a board piece");
         }
-        Piece pieceEntity = pieces.findById(item.getPieceId())
-                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
-        return finalizeSell(matchId, userId, item, pieceEntity);
+        return finalizeSell(matchId, userId, pieceKey, true, null, fromX, fromY);
     }
 
-    private SellPieceResponse finalizeSell(Integer matchId, Long userId, PlayerInventory item, Piece pieceEntity) {
-        String pieceKey = normalizePieceKey(pieceEntity.getName());
-        int refund = pieceEntity.getCostGold();
+    private SellPieceResponse finalizeSell(
+            Integer matchId,
+            Long userId,
+            String pieceKey,
+            boolean fromBoard,
+            Integer benchSlot,
+            Integer boardX,
+            Integer boardY
+    ) {
+        int refund = resolvePieceCost(pieceKey);
         PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId)
                 .orElseThrow(() -> new IllegalArgumentException("Player resources not found"));
-        int moneyBefore = pr.getGold();
-        pr.setGold(moneyBefore + refund);
-        resources.save(pr);
-        inventory.delete(item);
+        redisState.initPlayerResourcesIfAbsent(matchId, userId, pr.getGold(), pr.getHp());
+        int moneyBefore = redisState.getPlayerGold(matchId, userId, pr.getGold());
+        int moneyAfter = moneyBefore + refund;
+        redisState.setPlayerGold(matchId, userId, moneyAfter);
+        if (fromBoard && boardX != null && boardY != null) {
+            redisState.clearPlayerBoardSquare(matchId, userId, boardX, boardY);
+        } else if (benchSlot != null) {
+            redisState.clearBenchSlot(matchId, userId, benchSlot);
+        }
         logger.info(LOG_SELL_PIECE, matchId, userId, pieceKey, refund);
-        return new SellPieceResponse(pieceKey, moneyBefore, pr.getGold());
+        return new SellPieceResponse(pieceKey, moneyBefore, moneyAfter);
     }
 
     @Transactional
@@ -512,40 +641,34 @@ public class GameService {
         logger.info(LOG_MOVE_PIECE, matchId, userId, req.fromX(), req.fromY(), req.toX(), req.toY());
 
         ensurePlayerInMatch(matchId, userId);
+        ensureMatchInProgress(matchId);
 
         if (req.fromX().equals(req.toX()) && req.fromY().equals(req.toY())) {
             return;
         }
 
-        PlayerInventory piece = inventory
-                .findByMatchIdAndUserIdAndPositionXAndPositionY(matchId, userId, req.fromX(), req.fromY())
-                .orElseThrow(() -> new IllegalArgumentException("No piece on that square"));
-
-        if (!piece.isOnBoard()) {
-            throw new IllegalArgumentException("That square does not hold a board piece");
+        String pieceKey = redisState.getPlayerBoardPieceKey(matchId, userId, req.fromX(), req.fromY());
+        if (pieceKey == null || pieceKey.isBlank()) {
+            throw new IllegalArgumentException("No piece on that square");
         }
-
-        Piece pieceEntity = pieces.findById(piece.getPieceId())
-                .orElseThrow(() -> new IllegalStateException("Unknown piece"));
-        if (isPawnPiece(pieceEntity)) {
+        if ("pawn".equals(pieceKey)) {
             validatePawnSquare(req.toX(), req.toY());
         }
 
         ensureTargetNotOnKing(matchId, userId, req.toX(), req.toY());
 
-        if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
-                matchId, userId, req.toX(), req.toY())) {
+        if (redisState.isPlayerBoardSquareOccupied(matchId, userId, req.toX(), req.toY())) {
             throw new IllegalStateException("That square is already occupied");
         }
 
-        piece.setPositionX(req.toX());
-        piece.setPositionY(req.toY());
-        inventory.save(piece);
+        redisState.clearPlayerBoardSquare(matchId, userId, req.fromX(), req.fromY());
+        redisState.setPlayerBoardSquare(matchId, userId, req.toX(), req.toY(), pieceKey);
     }
 
     @Transactional
     public void moveKing(Integer matchId, Long userId, MoveKingRequest req) {
         ensurePlayerInMatch(matchId, userId);
+        ensureMatchInProgress(matchId);
         validateKingLane(req.toX());
         validateKingRank(req.toY());
 
@@ -561,6 +684,52 @@ public class GameService {
         ensureTargetNotOccupiedByPiece(matchId, userId, req.toX(), req.toY());
 
         redisState.setKingSquare(matchId, userId, req.toX(), req.toY());
+    }
+
+    @Transactional
+    public void resignMatch(Integer matchId, Long userId) {
+        ensurePlayerInMatch(matchId, userId);
+        List<Long> ordered = matchPlayers.findAllByMatchId(matchId).stream()
+                .map(MatchPlayer::getUserId)
+                .sorted()
+                .toList();
+        if (ordered.size() != 2) {
+            throw new IllegalStateException("Resign requires exactly two players");
+        }
+        long opponent = ordered.get(0).equals(userId) ? ordered.get(1) : ordered.get(0);
+        Match m = matches.findByIdForUpdate(matchId)
+                .orElseThrow(() -> new IllegalArgumentException(ERROR_MATCH_NOT_FOUND_MESSAGE + matchId));
+        if (!m.isInProgress()) {
+            throw new IllegalStateException("This match has ended");
+        }
+        m.finish(opponent);
+        matches.save(m);
+        persistRuntimeShopStateToDatabase(matchId);
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("winnerUserId", opponent);
+        meta.put("loserUserId", userId);
+        meta.put("reason", "resign");
+        analyticsEventPublisher.publish("match_finished", opponent, (long) matchId, meta);
+        long win = opponent;
+        long lose = userId;
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                matchRatingNotifier.notifyMatchFinished(win, lose);
+            }
+        });
+    }
+
+    public void ensureMatchInProgress(Integer matchId) {
+        Match match = matches.findById(matchId)
+                .orElseThrow(() -> new IllegalArgumentException(ERROR_MATCH_NOT_FOUND_MESSAGE + matchId));
+        if (match.isFinished()) {
+            throw new IllegalStateException("This match has ended");
+        }
+        if (!match.isInProgress()) {
+            // Defensive: createMatch now starts the match immediately, so WAITING should not occur in practice.
+            throw new IllegalStateException("This match has not started yet");
+        }
     }
 
     private void validateKingLane(int col) {
@@ -595,10 +764,37 @@ public class GameService {
 
     /** King tile may stack visually only on empty squares for pieces. */
     private void ensureTargetNotOccupiedByPiece(Integer matchId, Long userId, int x, int y) {
-        if (inventory.existsByMatchIdAndUserIdAndPositionXAndPositionYAndIsOnBoardIsTrue(
-                matchId, userId, x, y)) {
+        if (redisState.isPlayerBoardSquareOccupied(matchId, userId, x, y)) {
             throw new IllegalStateException("That square is already occupied");
         }
+    }
+
+    private List<BoardPieceResponse> getOrSeedRuntimeBoard(
+            Integer matchId,
+            Long userId,
+            List<BoardPieceResponse> boardPiecesFromDb
+    ) {
+        if (!redisState.hasAnyPlayerBoardData(matchId, userId)) {
+            /*
+             Empty hash either means first load (seed from persistence) or the player legitimately cleared the
+             board in Redis via sell/move—DB inventory is only snapshotted after battles, so re-seeding here would
+             resurrect sold pieces ("infinite sell").
+             */
+            if (redisState.isRuntimeShopBoardTouched(matchId, userId)) {
+                return List.of();
+            }
+            List<GameStateRedisService.RuntimeBoardPiece> seed = boardPiecesFromDb.stream()
+                    .map(p -> new GameStateRedisService.RuntimeBoardPiece(p.x(), p.y(), p.piece()))
+                    .toList();
+            redisState.replacePlayerBoard(matchId, userId, seed);
+            redisState.markRuntimeShopBoardTouched(matchId, userId);
+            return boardPiecesFromDb;
+        }
+        List<GameStateRedisService.RuntimeBoardPiece> fromRedis = redisState.getPlayerBoard(matchId, userId);
+        redisState.markRuntimeShopBoardTouched(matchId, userId);
+        return fromRedis.stream()
+                .map(p -> new BoardPieceResponse(p.x(), p.y(), p.pieceKey()))
+                .toList();
     }
 
     private void ensurePlayerInMatch(Integer matchId, Long userId) {
@@ -614,15 +810,13 @@ public class GameService {
     }
 
     private int resolvePieceCost(String pieceKey) {
-        return pieces.findByNameIgnoreCase(toDbPieceName(pieceKey))
-                .map(Piece::getCostGold)
-                .orElseGet(() -> switch (pieceKey) {
-                    case "pawn" -> 1;
-                    case "knight", "bishop" -> 3;
-                    case "rook" -> 5;
-                    case "queen" -> 8;
-                    default -> 99;
-                });
+        return switch (pieceKey) {
+            case "pawn" -> 1;
+            case "knight", "bishop" -> 3;
+            case "rook" -> 5;
+            case "queen" -> 8;
+            default -> 99;
+        };
     }
 
     private String toDbPieceName(String pieceKey) {
@@ -642,10 +836,107 @@ public class GameService {
 
     private int findFirstFreeBenchSlot(Integer matchId, Long userId) {
         for (int slot = 0; slot < 8; slot++) {
-            boolean occupied = inventory.existsByMatchIdAndUserIdAndPositionXAndPositionY(
-                    matchId, userId, slot, BENCH_POSITION_Y);
+            boolean occupied = redisState.isBenchSlotOccupied(matchId, userId, slot);
             if (!occupied) return slot;
         }
         throw new IllegalStateException("Bench is full");
+    }
+
+    private List<BenchSlotResponse> getOrSeedRuntimeBench(Integer matchId, Long userId) {
+        if (!redisState.hasAnyBenchData(matchId, userId)) {
+            if (redisState.isRuntimeShopBenchTouched(matchId, userId)) {
+                return List.of();
+            }
+            List<BenchSlotResponse> benchFromDb = loadBenchFromDb(matchId, userId);
+            List<GameStateRedisService.RuntimeBenchPiece> seed = benchFromDb.stream()
+                    .map(b -> new GameStateRedisService.RuntimeBenchPiece(b.slot(), b.piece()))
+                    .toList();
+            redisState.replaceBench(matchId, userId, seed);
+            redisState.markRuntimeShopBenchTouched(matchId, userId);
+            return benchFromDb;
+        }
+        List<BenchSlotResponse> bench = redisState.getBench(matchId, userId).stream()
+                .map(b -> new BenchSlotResponse(b.slot(), b.pieceKey()))
+                .sorted(Comparator.comparingInt(BenchSlotResponse::slot))
+                .toList();
+        redisState.markRuntimeShopBenchTouched(matchId, userId);
+        return bench;
+    }
+
+    private List<BenchSlotResponse> loadBenchFromDb(Integer matchId, Long userId) {
+        List<BenchSlotResponse> out = new ArrayList<>();
+        for (PlayerInventory item : inventory.findAllByMatchIdAndUserId(matchId, userId)) {
+            if (item.isOnBoard() || item.getPositionY() != BENCH_POSITION_Y) continue;
+            pieces.findById(item.getPieceId()).ifPresent(pieceEntity ->
+                    out.add(new BenchSlotResponse(item.getPositionX(), normalizePieceKey(pieceEntity.getName()))));
+        }
+        out.sort(Comparator.comparingInt(BenchSlotResponse::slot));
+        return out;
+    }
+
+    private List<BoardPieceResponse> loadBoardPiecesFromDb(Integer matchId, Long userId) {
+        List<BoardPieceResponse> out = new ArrayList<>();
+        for (PlayerInventory item : inventory.findAllByMatchIdAndUserId(matchId, userId)) {
+            if (!item.isOnBoard()) continue;
+            pieces.findById(item.getPieceId()).ifPresent(pieceEntity ->
+                    out.add(new BoardPieceResponse(item.getPositionX(), item.getPositionY(), normalizePieceKey(pieceEntity.getName()))));
+        }
+        return out;
+    }
+
+    private void persistRuntimeShopStateToDatabase(Integer matchId) {
+        Map<String, Piece> pieceByKey = new HashMap<>();
+        for (String key : List.of("pawn", "knight", "bishop", "rook", "queen")) {
+            pieceByKey.put(key, findPieceEntity(key));
+        }
+
+        for (MatchPlayer mp : matchPlayers.findAllByMatchId(matchId)) {
+            long userId = mp.getUserId();
+            PlayerResources pr = resources.findByMatchIdAndUserId(matchId, userId).orElseGet(() -> {
+                PlayerResources created = new PlayerResources();
+                created.setMatchId(matchId);
+                created.setUserId(userId);
+                created.setGold(PlayerResources.DEFAULT_GOLD);
+                created.setHp(PlayerResources.DEFAULT_HP);
+                created.setLevel(PlayerResources.DEFAULT_LEVEL);
+                created.setExperience(PlayerResources.DEFAULT_EXPERIENCE);
+                return created;
+            });
+            redisState.initPlayerResourcesIfAbsent(matchId, userId, pr.getGold(), pr.getHp());
+            pr.setGold(redisState.getPlayerGold(matchId, userId, pr.getGold()));
+            pr.setHp(redisState.getPlayerHp(matchId, userId, pr.getHp()));
+            resources.save(pr);
+
+            inventory.deleteAllByMatchIdAndUserId(matchId, userId);
+            // Ensure DELETE reaches DB before INSERTs in this transaction,
+            // otherwise unique (match_id,user_id,position_x,position_y) can collide.
+            inventory.flush();
+
+            for (GameStateRedisService.RuntimeBenchPiece b : redisState.getBench(matchId, userId)) {
+                Piece piece = pieceByKey.get(normalizePieceKey(b.pieceKey()));
+                if (piece == null) continue;
+                PlayerInventory item = new PlayerInventory();
+                item.setMatchId(matchId);
+                item.setUserId(userId);
+                item.setPieceId(piece.getId());
+                item.setPositionX(b.slot());
+                item.setPositionY(BENCH_POSITION_Y);
+                item.setOnBoard(false);
+                inventory.save(item);
+            }
+
+            for (GameStateRedisService.RuntimeBoardPiece b : redisState.getPlayerBoard(matchId, userId)) {
+                Piece piece = pieceByKey.get(normalizePieceKey(b.pieceKey()));
+                if (piece == null) continue;
+                PlayerInventory item = new PlayerInventory();
+                item.setMatchId(matchId);
+                item.setUserId(userId);
+                item.setPieceId(piece.getId());
+                item.setPositionX(b.x());
+                item.setPositionY(b.y());
+                item.setOnBoard(true);
+                inventory.save(item);
+            }
+        }
     }
 }

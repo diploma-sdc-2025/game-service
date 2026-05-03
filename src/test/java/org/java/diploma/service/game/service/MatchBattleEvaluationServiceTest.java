@@ -123,7 +123,9 @@ class MatchBattleEvaluationServiceTest {
                 List.of("e2e4"),
                 111L,
                 100,
-                95
+                95,
+                false,
+                null
         );
     }
 }

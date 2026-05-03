@@ -6,5 +6,6 @@ public record MatchResponse(
         Integer matchId,
         String status,
         int currentRound,
-        List<Long> players
+        List<Long> players,
+        Long winnerUserId
 ) {}

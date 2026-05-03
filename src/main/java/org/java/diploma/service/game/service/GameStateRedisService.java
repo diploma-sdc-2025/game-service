@@ -9,6 +9,8 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -19,6 +21,13 @@ public class GameStateRedisService {
 
     private static final String REDIS_KEY_PREFIX_STATE = "game:state:";
     private static final String REDIS_KEY_PREFIX_BOARD = "game:board:";
+    private static final String REDIS_KEY_PREFIX_PLAYER_BOARD = "game:playerBoard:";
+    private static final String REDIS_KEY_PREFIX_PLAYER_BENCH = "game:playerBench:";
+    /** When set, an empty Redis board hash means "sold everything", not "never seeded" (avoid stale DB replay). */
+    private static final String REDIS_KEY_PREFIX_RUNTIME_BOARD_TOUCHED = "game:runtimeBoardTouched:v1:";
+    /** Same for bench: selling the last bench piece must not re-trigger {@code loadBenchFromDb}. */
+    private static final String REDIS_KEY_PREFIX_RUNTIME_BENCH_TOUCHED = "game:runtimeBenchTouched:v1:";
+    private static final String REDIS_KEY_PREFIX_PLAYER_RES = "game:playerRes:";
     private static final String REDIS_KEY_PREFIX_KING = "game:king:";
     /** v2: per-cycle round is advanced after each battle so keys rotate with new shop setups. */
     private static final String REDIS_KEY_PREFIX_BATTLE_EVAL = "game:battleEval:v2:";
@@ -29,6 +38,7 @@ public class GameStateRedisService {
     private static final String REDIS_KEY_LAST_BATTLE_EVAL = "game:lastBattleEval:v1:";
     private static final String REDIS_KEY_LAST_BATTLE_ROUND = "game:lastBattleRound:v1:";
     private static final String REDIS_KEY_BATTLE_VIEWED_PREFIX = "game:battleViewed:v1:";
+    private static final String REDIS_KEY_BATTLE_APPLIED_PREFIX = "game:battleApplied:v1:";
     private static final String REDIS_KEY_SHOP_PHASE_ENDS = "game:shopPhaseEndsAt:";
     private static final String REDIS_KEY_SHOP_TIMER_ROUND = "game:shopTimerRound:";
 
@@ -47,6 +57,8 @@ public class GameStateRedisService {
     private static final String LOG_GET_BOARD = "Retrieving game board from Redis: matchId={}";
     private static final String HASH_KEY_X = "x";
     private static final String HASH_KEY_Y = "y";
+    private static final String HASH_KEY_GOLD = "gold";
+    private static final String HASH_KEY_HP = "hp";
 
     private static final int DEFAULT_KING_COL = 4;
     private static final int DEFAULT_KING_ROW = 7;
@@ -70,8 +82,9 @@ public class GameStateRedisService {
         ));
 
         redis.opsForValue().set(boardKey(matchId), new int[0][0]);
-
-        seedShopPhaseTimerForRound(matchId, INITIAL_ROUND);
+        // Do not start the shop timer at matchmaking time.
+        // First /shop request should start it so players get full round duration.
+        clearShopPhaseTimer(matchId);
 
         logger.info(LOG_STATE_INITIALIZED, matchId, PHASE_SHOP, INITIAL_ROUND);
     }
@@ -118,6 +131,152 @@ public class GameStateRedisService {
     public Object getBoard(long matchId) {
         logger.debug(LOG_GET_BOARD, matchId);
         return redis.opsForValue().get(boardKey(matchId));
+    }
+
+    /**
+     * Runtime board occupancy (per player) for fast move validation.
+     * Hash field: {@code "x:y"} -> piece key (e.g. pawn, knight).
+     */
+    public void setPlayerBoardSquare(long matchId, long userId, int x, int y, String pieceKey) {
+        redis.opsForHash().put(playerBoardKey(matchId, userId), boardSquareField(x, y), pieceKey);
+    }
+
+    public void clearPlayerBoardSquare(long matchId, long userId, int x, int y) {
+        redis.opsForHash().delete(playerBoardKey(matchId, userId), boardSquareField(x, y));
+    }
+
+    public boolean isPlayerBoardSquareOccupied(long matchId, long userId, int x, int y) {
+        return redis.opsForHash().hasKey(playerBoardKey(matchId, userId), boardSquareField(x, y));
+    }
+
+    public String getPlayerBoardPieceKey(long matchId, long userId, int x, int y) {
+        Object raw = redis.opsForHash().get(playerBoardKey(matchId, userId), boardSquareField(x, y));
+        return raw == null ? null : raw.toString();
+    }
+
+    public List<RuntimeBoardPiece> getPlayerBoard(long matchId, long userId) {
+        Map<Object, Object> entries = redis.opsForHash().entries(playerBoardKey(matchId, userId));
+        List<RuntimeBoardPiece> pieces = new ArrayList<>();
+        for (Map.Entry<Object, Object> e : entries.entrySet()) {
+            String field = e.getKey() == null ? null : e.getKey().toString();
+            if (field == null || !field.contains(":")) {
+                continue;
+            }
+            String[] parts = field.split(":");
+            if (parts.length != 2) {
+                continue;
+            }
+            try {
+                int x = Integer.parseInt(parts[0]);
+                int y = Integer.parseInt(parts[1]);
+                String pieceKey = e.getValue() == null ? "" : e.getValue().toString();
+                pieces.add(new RuntimeBoardPiece(x, y, pieceKey));
+            } catch (NumberFormatException ignored) {
+                // ignore malformed fields
+            }
+        }
+        return pieces;
+    }
+
+    public boolean hasAnyPlayerBoardData(long matchId, long userId) {
+        Long size = redis.opsForHash().size(playerBoardKey(matchId, userId));
+        return size != null && size > 0;
+    }
+
+    public void replacePlayerBoard(long matchId, long userId, List<RuntimeBoardPiece> pieces) {
+        String key = playerBoardKey(matchId, userId);
+        redis.delete(key);
+        if (pieces == null || pieces.isEmpty()) {
+            return;
+        }
+        for (RuntimeBoardPiece piece : pieces) {
+            setPlayerBoardSquare(matchId, userId, piece.x(), piece.y(), piece.pieceKey());
+        }
+    }
+
+    public void initPlayerResourcesIfAbsent(long matchId, long userId, int gold, int hp) {
+        String key = playerResourcesKey(matchId, userId);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) {
+            return;
+        }
+        redis.opsForHash().putAll(key, Map.of(
+                HASH_KEY_GOLD, Integer.toString(gold),
+                HASH_KEY_HP, Integer.toString(hp)
+        ));
+    }
+
+    public int getPlayerGold(long matchId, long userId, int fallback) {
+        Object raw = redis.opsForHash().get(playerResourcesKey(matchId, userId), HASH_KEY_GOLD);
+        if (raw == null) return fallback;
+        try {
+            return Integer.parseInt(raw.toString());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    public void setPlayerGold(long matchId, long userId, int gold) {
+        redis.opsForHash().put(playerResourcesKey(matchId, userId), HASH_KEY_GOLD, Integer.toString(gold));
+    }
+
+    public int getPlayerHp(long matchId, long userId, int fallback) {
+        Object raw = redis.opsForHash().get(playerResourcesKey(matchId, userId), HASH_KEY_HP);
+        if (raw == null) return fallback;
+        try {
+            return Integer.parseInt(raw.toString());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    public void setPlayerHp(long matchId, long userId, int hp) {
+        redis.opsForHash().put(playerResourcesKey(matchId, userId), HASH_KEY_HP, Integer.toString(hp));
+    }
+
+    public void setBenchSlot(long matchId, long userId, int slot, String pieceKey) {
+        redis.opsForHash().put(playerBenchKey(matchId, userId), Integer.toString(slot), pieceKey);
+    }
+
+    public void clearBenchSlot(long matchId, long userId, int slot) {
+        redis.opsForHash().delete(playerBenchKey(matchId, userId), Integer.toString(slot));
+    }
+
+    public String getBenchSlotPieceKey(long matchId, long userId, int slot) {
+        Object raw = redis.opsForHash().get(playerBenchKey(matchId, userId), Integer.toString(slot));
+        return raw == null ? null : raw.toString();
+    }
+
+    public boolean isBenchSlotOccupied(long matchId, long userId, int slot) {
+        return redis.opsForHash().hasKey(playerBenchKey(matchId, userId), Integer.toString(slot));
+    }
+
+    public boolean hasAnyBenchData(long matchId, long userId) {
+        Long size = redis.opsForHash().size(playerBenchKey(matchId, userId));
+        return size != null && size > 0;
+    }
+
+    public List<RuntimeBenchPiece> getBench(long matchId, long userId) {
+        Map<Object, Object> entries = redis.opsForHash().entries(playerBenchKey(matchId, userId));
+        List<RuntimeBenchPiece> out = new ArrayList<>();
+        for (Map.Entry<Object, Object> e : entries.entrySet()) {
+            try {
+                int slot = Integer.parseInt(String.valueOf(e.getKey()));
+                String pieceKey = String.valueOf(e.getValue());
+                out.add(new RuntimeBenchPiece(slot, pieceKey));
+            } catch (Exception ignored) {
+                // ignore malformed entries
+            }
+        }
+        return out;
+    }
+
+    public void replaceBench(long matchId, long userId, List<RuntimeBenchPiece> pieces) {
+        String key = playerBenchKey(matchId, userId);
+        redis.delete(key);
+        if (pieces == null || pieces.isEmpty()) return;
+        for (RuntimeBenchPiece p : pieces) {
+            setBenchSlot(matchId, userId, p.slot(), p.pieceKey());
+        }
     }
 
     /** e1 default at white's back rank. */
@@ -174,17 +333,20 @@ public class GameStateRedisService {
     }
 
     /**
-     * After a battle round is fully resolved and cached, advance the cycle counter so the next shop → battle
-     * uses a fresh cache key and rebuilds FEN from current DB pieces.
+     * After a battle round is fully resolved and cached: advance Redis shop-round and pin the shared shop deadline
+     * to {@code scheduledShopEndsAtEpochMs} (typically replay end + {@link #SHOP_PHASE_DURATION_SECONDS}s) so players
+     * who poll /shop early do not shorten the placement window for others still watching the replay.
      */
-    public void incrementShopRoundAfterBattle(long matchId) {
+    public void incrementShopRoundAfterBattle(long matchId, long scheduledShopEndsAtEpochMs) {
         Object raw = redis.opsForValue().get(stateKey(matchId));
         String phase = readPhaseFromState(raw);
         int current = readRoundFromState(raw);
         int next = current + 1;
         redis.opsForValue().set(stateKey(matchId), Map.of(STATE_KEY_PHASE, phase, STATE_KEY_ROUND, next));
-        clearShopPhaseTimer(matchId);
-        logger.info("Advanced shop/battle cycle: matchId={}, round {} -> {}", matchId, current, next);
+        stringRedis.opsForValue().set(shopEndsKey(matchId), Long.toString(scheduledShopEndsAtEpochMs));
+        stringRedis.opsForValue().set(shopTimerRoundKey(matchId), Integer.toString(next));
+        logger.info("Advanced shop/battle cycle: matchId={}, round {} -> {}, shopEndsAtEpochMs={}",
+                matchId, current, next, scheduledShopEndsAtEpochMs);
     }
 
     private int readRoundFromState(Object raw) {
@@ -251,6 +413,16 @@ public class GameStateRedisService {
         stringRedis.expire(key, BATTLE_EVAL_CACHE_TTL);
     }
 
+    /**
+     * Idempotency guard for battle round side effects (HP/gold/round advance).
+     * Returns true only for the first caller for (matchId, round).
+     */
+    public boolean tryMarkBattleRoundApplied(long matchId, int round) {
+        String key = battleAppliedKey(matchId, round);
+        Boolean acquired = stringRedis.opsForValue().setIfAbsent(key, "1", BATTLE_EVAL_CACHE_TTL);
+        return Boolean.TRUE.equals(acquired);
+    }
+
     private String battleEvalKey(long matchId, int round) {
         return REDIS_KEY_PREFIX_BATTLE_EVAL + matchId + ":" + round;
     }
@@ -267,6 +439,10 @@ public class GameStateRedisService {
         return REDIS_KEY_BATTLE_VIEWED_PREFIX + matchId + ":" + round;
     }
 
+    private String battleAppliedKey(long matchId, int round) {
+        return REDIS_KEY_BATTLE_APPLIED_PREFIX + matchId + ":" + round;
+    }
+
     private String stateKey(long matchId) {
         return REDIS_KEY_PREFIX_STATE + matchId;
     }
@@ -275,9 +451,52 @@ public class GameStateRedisService {
         return REDIS_KEY_PREFIX_BOARD + matchId;
     }
 
+    private String playerBoardKey(long matchId, long userId) {
+        return REDIS_KEY_PREFIX_PLAYER_BOARD + matchId + ":" + userId;
+    }
+
+    private String playerBenchKey(long matchId, long userId) {
+        return REDIS_KEY_PREFIX_PLAYER_BENCH + matchId + ":" + userId;
+    }
+
+    private String runtimeBoardTouchedKey(long matchId, long userId) {
+        return REDIS_KEY_PREFIX_RUNTIME_BOARD_TOUCHED + matchId + ":" + userId;
+    }
+
+    private String runtimeBenchTouchedKey(long matchId, long userId) {
+        return REDIS_KEY_PREFIX_RUNTIME_BENCH_TOUCHED + matchId + ":" + userId;
+    }
+
+    public boolean isRuntimeShopBoardTouched(long matchId, long userId) {
+        return Boolean.TRUE.equals(redis.hasKey(runtimeBoardTouchedKey(matchId, userId)));
+    }
+
+    /** Marks Redis board once hydrated from DB or after reading any non-null runtime board state. */
+    public void markRuntimeShopBoardTouched(long matchId, long userId) {
+        redis.opsForValue().set(runtimeBoardTouchedKey(matchId, userId), "1");
+    }
+
+    public boolean isRuntimeShopBenchTouched(long matchId, long userId) {
+        return Boolean.TRUE.equals(redis.hasKey(runtimeBenchTouchedKey(matchId, userId)));
+    }
+
+    public void markRuntimeShopBenchTouched(long matchId, long userId) {
+        redis.opsForValue().set(runtimeBenchTouchedKey(matchId, userId), "1");
+    }
+
+    private String playerResourcesKey(long matchId, long userId) {
+        return REDIS_KEY_PREFIX_PLAYER_RES + matchId + ":" + userId;
+    }
+
+    private String boardSquareField(int x, int y) {
+        return x + ":" + y;
+    }
+
     private String kingKey(long matchId, long userId) {
         return REDIS_KEY_PREFIX_KING + matchId + ":" + userId;
     }
 
     public record LastBattleEval(int round, String json) {}
+    public record RuntimeBoardPiece(int x, int y, String pieceKey) {}
+    public record RuntimeBenchPiece(int slot, String pieceKey) {}
 }

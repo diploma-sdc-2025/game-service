@@ -7,13 +7,13 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.web.client.RestClient;
 
 @Configuration
-public class BattleClientConfig {
+public class AuthInternalClientConfig {
 
-    public static final String BATTLE_REST_CLIENT = "battleRestClient";
+    public static final String AUTH_INTERNAL_REST_CLIENT = "authInternalRestClient";
 
     @Bean
-    @Qualifier(BATTLE_REST_CLIENT)
-    RestClient battleRestClient(@Value("${diploma.battle-service.url:http://localhost:8084}") String baseUrl) {
+    @Qualifier(AUTH_INTERNAL_REST_CLIENT)
+    RestClient authInternalRestClient(@Value("${diploma.auth-service.url:http://localhost:8080}") String baseUrl) {
         return RestClient.builder()
                 .baseUrl(baseUrl)
                 .build();

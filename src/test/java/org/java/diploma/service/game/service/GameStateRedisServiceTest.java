@@ -54,7 +54,7 @@ class GameStateRedisServiceTest {
 
         verify(valueOps).set("game:state:7", Map.of("phase", "SHOP", "round", 1));
         verify(valueOps).set("game:board:7", new int[0][0]);
-        verify(stringValueOps, times(2)).set(anyString(), anyString());
+        verify(stringRedis, times(2)).delete(anyString());
     }
 
     @Test
@@ -158,11 +158,11 @@ class GameStateRedisServiceTest {
     void incrementShopRoundAfterBattle_preservesPhaseAndIncrementsRound() {
         when(valueOps.get("game:state:4")).thenReturn(Map.of("phase", "SHOP", "round", 2));
 
-        service.incrementShopRoundAfterBattle(4);
+        service.incrementShopRoundAfterBattle(4, 9_999_888_777L);
 
         verify(valueOps).set("game:state:4", Map.of("phase", "SHOP", "round", 3));
-        verify(stringRedis).delete("game:shopPhaseEndsAt:4");
-        verify(stringRedis).delete("game:shopTimerRound:4");
+        verify(stringValueOps).set("game:shopPhaseEndsAt:4", "9999888777");
+        verify(stringValueOps).set("game:shopTimerRound:4", "3");
     }
 
     @Test

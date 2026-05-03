@@ -19,4 +19,6 @@ public interface PlayerInventoryRepository extends JpaRepository<PlayerInventory
 
     Optional<PlayerInventory> findByMatchIdAndUserIdAndPositionXAndPositionY(
             Integer matchId, Long userId, int positionX, int positionY);
+
+    void deleteAllByMatchIdAndUserId(Integer matchId, Long userId);
 }

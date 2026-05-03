@@ -112,9 +112,14 @@ public class GameController {
             logger.info(PIECE_BOUGHT, matchId, userId, response.piece());
             return response;
         } catch (IllegalArgumentException e) {
+            logger.warn("buyPiece -> 400 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (IllegalStateException e) {
+            logger.warn("buyPiece -> 409 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        } catch (RuntimeException e) {
+            logger.error("buyPiece -> 500 matchId={} userId={}", matchId, userId, e);
+            throw e;
         }
     }
 
@@ -144,9 +149,14 @@ public class GameController {
             logger.info(PIECE_PLACED, matchId, userId);
             return ResponseEntity.noContent().build();
         } catch (IllegalArgumentException e) {
+            logger.warn("placePieceFromBench -> 400 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (IllegalStateException e) {
+            logger.warn("placePieceFromBench -> 409 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        } catch (RuntimeException e) {
+            logger.error("placePieceFromBench -> 500 matchId={} userId={}", matchId, userId, e);
+            throw e;
         }
     }
 
@@ -176,9 +186,14 @@ public class GameController {
             logger.info(KING_MOVED, matchId, userId);
             return ResponseEntity.noContent().build();
         } catch (IllegalArgumentException e) {
+            logger.warn("moveKing -> 400 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (IllegalStateException e) {
+            logger.warn("moveKing -> 409 matchId={} userId={} reason={}", matchId, userId, e.getMessage());
             throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        } catch (RuntimeException e) {
+            logger.error("moveKing -> 500 matchId={} userId={}", matchId, userId, e);
+            throw e;
         }
     }
 
@@ -196,14 +211,29 @@ public class GameController {
         }
     }
 
+    @PostMapping("/matches/{matchId}/resign")
+    public ResponseEntity<Void> resign(@PathVariable Integer matchId, Authentication authentication) {
+        Long userId = requireUserId(authentication);
+        try {
+            game.resignMatch(matchId, userId);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage());
+        }
+    }
+
     private Long requireUserId(Authentication authentication) {
         if (authentication == null || authentication.getName() == null) {
-            throw new IllegalArgumentException("Missing authenticated user");
+            logger.warn("requireUserId -> missing authentication; auth={}", authentication);
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Missing authenticated user");
         }
         try {
             return Long.parseLong(authentication.getName());
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Invalid user id in token");
+            logger.warn("requireUserId -> non-numeric subject '{}'", authentication.getName());
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid user id in token");
         }
     }
 }

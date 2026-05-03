@@ -16,7 +16,9 @@ public record BattleRoundEvaluationResponse(
         List<String> principalVariation,
         long battleViewEndsAt,
         int whiteHp,
-        int blackHp
+        int blackHp,
+        Boolean matchFinished,
+        Long winnerUserId
 ) {
     /**
      * Redis-cached payloads may have been built for another player; re-bind the viewer flag for this requester.
@@ -36,7 +38,9 @@ public record BattleRoundEvaluationResponse(
                 principalVariation,
                 battleViewEndsAt,
                 whiteHp,
-                blackHp
+                blackHp,
+                matchFinished,
+                winnerUserId
         );
     }
 }
