@@ -12,6 +12,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
@@ -36,13 +37,18 @@ public class SecurityConfig {
     private static final String CONFIGURING_SECURITY = "Configuring Game Service security";
 
     /**
-     * Allows browser calls when VITE_GAME_URL points at this service (localhost:3000 → localhost:8083).
-     * Same-origin via Vite proxy does not need CORS.
+     * Allows browser calls when the UI hits this service through a dev proxy or direct URL.
+     * Override with comma-separated patterns, e.g. {@code http://203.0.113.10:*} for Vite on a VM.
      */
     @Bean
-    CorsConfigurationSource corsConfigurationSource() {
+    CorsConfigurationSource corsConfigurationSource(
+            @Value("${cors.allowed-origin-patterns}") String patternsCsv) {
         CorsConfiguration c = new CorsConfiguration();
-        c.setAllowedOriginPatterns(List.of("http://localhost:*", "http://127.0.0.1:*"));
+        List<String> patterns = Arrays.stream(patternsCsv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+        c.setAllowedOriginPatterns(patterns);
         c.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"));
         c.setAllowedHeaders(List.of("*"));
         c.setExposedHeaders(List.of("*"));
