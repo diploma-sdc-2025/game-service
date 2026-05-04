@@ -111,7 +111,7 @@ class GameServiceTest {
         when(deps.matchPlayers.existsByMatchIdAndUserId(1, 10L)).thenReturn(true);
         when(deps.matches.findById(1)).thenReturn(Optional.of(inProgressMatch(1)));
         when(deps.pieces.findByNameIgnoreCase("Pawn")).thenReturn(Optional.of(piece(101, "Pawn", 1)));
-        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 5, 50)));
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 5, 30)));
         when(deps.inventory.existsByMatchIdAndUserIdAndPositionXAndPositionY(1, 10L, 3, 8)).thenReturn(false);
 
         BuyPieceResponse response = deps.sut().buyPiece(1, 10L, new BuyPieceRequest("pawn", 3));
@@ -126,7 +126,7 @@ class GameServiceTest {
         when(deps.matchPlayers.existsByMatchIdAndUserId(1, 10L)).thenReturn(true);
         when(deps.matches.findById(1)).thenReturn(Optional.of(inProgressMatch(1)));
         when(deps.pieces.findByNameIgnoreCase("Pawn")).thenReturn(Optional.of(piece(101, "Pawn", 1)));
-        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 3, 50)));
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 3, 30)));
         when(deps.redisState.isBenchSlotOccupied(1, 10L, 0)).thenReturn(true);
         when(deps.redisState.isBenchSlotOccupied(1, 10L, 1)).thenReturn(false);
 
@@ -138,7 +138,7 @@ class GameServiceTest {
         }
         when(deps.matchPlayers.existsByMatchIdAndUserId(2, 10L)).thenReturn(true);
         when(deps.matches.findById(2)).thenReturn(Optional.of(inProgressMatch(2)));
-        when(deps.resources.findByMatchIdAndUserId(2, 10L)).thenReturn(Optional.of(resources(2, 10L, 3, 50)));
+        when(deps.resources.findByMatchIdAndUserId(2, 10L)).thenReturn(Optional.of(resources(2, 10L, 3, 30)));
         for (int i = 0; i < 8; i++) {
             when(deps.redisState.isBenchSlotOccupied(2, 10L, i)).thenReturn(true);
         }
@@ -185,7 +185,7 @@ class GameServiceTest {
         when(deps.inventory.findByMatchIdAndUserIdAndPositionXAndPositionY(1, 10L, 1, 8)).thenReturn(Optional.of(bench));
         when(deps.redisState.getBenchSlotPieceKey(1, 10L, 1)).thenReturn("pawn");
         when(deps.pieces.findById(101)).thenReturn(Optional.of(piece(101, "Pawn", 1)));
-        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 2, 50)));
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 2, 30)));
 
         SellPieceResponse response = deps.sut().sellPiece(1, 10L, new SellPieceRequest(1, null, null));
         assertThat(response.moneyAfter()).isEqualTo(3);
@@ -230,7 +230,7 @@ class GameServiceTest {
         var deps = deps();
         when(deps.matchPlayers.existsByMatchIdAndUserId(1, 10L)).thenReturn(true);
         when(deps.matches.findById(1)).thenReturn(Optional.of(inProgressMatch(1)));
-        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 9, 50)));
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(resources(1, 10L, 9, 30)));
         // DB still lists a sold board piece until the next battle persist — must not resurrect it in Redis.
         when(deps.inventory.findAllByMatchIdAndUserId(1, 10L)).thenReturn(List.of(boardItem(1, 10L, 102, 2, 6)));
         when(deps.pieces.findById(102)).thenReturn(Optional.of(piece(102, "Knight", 3)));
@@ -288,7 +288,7 @@ class GameServiceTest {
         BattleRoundEvaluationResponse cached = new BattleRoundEvaluationResponse(
                 "fen", 10, "white", 10L, 20L, false,
                 List.of(), List.of(), new KingSquareResponse(4, 7), new KingSquareResponse(4, 7),
-                List.of("e2e4"), 1L, 50, 50, false, null);
+                List.of("e2e4"), 1L, 30, 30, false, null);
         when(deps.redisState.getCachedBattleEval(1, 3)).thenReturn(Optional.of(new ObjectMapper().writeValueAsString(cached)));
 
         BattleRoundEvaluationResponse out = deps.sut().finalizeBattleRoundEvaluation(
@@ -318,8 +318,8 @@ class GameServiceTest {
         when(deps.pieces.findByNameIgnoreCase("Bishop")).thenReturn(Optional.of(piece(103, "Bishop", 3)));
         when(deps.pieces.findByNameIgnoreCase("Rook")).thenReturn(Optional.of(piece(104, "Rook", 5)));
         when(deps.pieces.findByNameIgnoreCase("Queen")).thenReturn(Optional.of(piece(105, "Queen", 8)));
-        PlayerResources white = resources(1, 10L, 3, 50);
-        PlayerResources black = resources(1, 20L, 3, 50);
+        PlayerResources white = resources(1, 10L, 3, 30);
+        PlayerResources black = resources(1, 20L, 3, 30);
         when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(white));
         when(deps.resources.findByMatchIdAndUserId(1, 20L)).thenReturn(Optional.of(black));
 
@@ -342,6 +342,86 @@ class GameServiceTest {
             verify(deps.redisState).setCachedBattleEval(eq(1L), eq(5), anyString());
             verify(deps.redisState).setLastBattleEval(eq(1L), eq(5), anyString());
             verify(deps.redisState).incrementShopRoundAfterBattle(eq(1L), anyLong());
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    /** Black king on h8, White queen on h7 — vertical check. */
+    private static final String FEN_BLACK_KING_IN_CHECK = "7k/7Q/8/8/8/8/8/K7 w - - 0 1";
+
+    @Test
+    void finalizeBattleRoundEvaluation_blackOpeningCheck_appliesTenHpWhenCentipawnsZero() {
+        var deps = deps();
+        when(deps.matches.findByIdForUpdate(1)).thenReturn(Optional.of(inProgressMatch(1)));
+        when(deps.redisState.getCachedBattleEval(1, 7)).thenReturn(Optional.empty());
+        when(deps.redisState.tryMarkBattleRoundApplied(1, 7)).thenReturn(true);
+        MatchPlayer mp10 = new MatchPlayer();
+        mp10.setUserId(10L);
+        MatchPlayer mp20 = new MatchPlayer();
+        mp20.setUserId(20L);
+        when(deps.matchPlayers.findAllByMatchId(1)).thenReturn(List.of(mp10, mp20));
+        when(deps.redisState.getBench(eq(1), eq(10L))).thenReturn(List.of());
+        when(deps.redisState.getBench(eq(1), eq(20L))).thenReturn(List.of());
+        when(deps.redisState.getPlayerBoard(eq(1), eq(10L))).thenReturn(List.of());
+        when(deps.redisState.getPlayerBoard(eq(1), eq(20L))).thenReturn(List.of());
+        when(deps.pieces.findByNameIgnoreCase("Pawn")).thenReturn(Optional.of(piece(101, "Pawn", 1)));
+        when(deps.pieces.findByNameIgnoreCase("Knight")).thenReturn(Optional.of(piece(102, "Knight", 3)));
+        when(deps.pieces.findByNameIgnoreCase("Bishop")).thenReturn(Optional.of(piece(103, "Bishop", 3)));
+        when(deps.pieces.findByNameIgnoreCase("Rook")).thenReturn(Optional.of(piece(104, "Rook", 5)));
+        when(deps.pieces.findByNameIgnoreCase("Queen")).thenReturn(Optional.of(piece(105, "Queen", 8)));
+        PlayerResources white = resources(1, 10L, 3, 30);
+        PlayerResources black = resources(1, 20L, 3, 30);
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(white));
+        when(deps.resources.findByMatchIdAndUserId(1, 20L)).thenReturn(Optional.of(black));
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            BattleRoundEvaluationResponse out = deps.sut().finalizeBattleRoundEvaluation(
+                    1, 7, 10L, 10L, 20L, FEN_BLACK_KING_IN_CHECK, 0, "equal",
+                    List.of(), List.of(),
+                    new KingSquareResponse(4, 7), new KingSquareResponse(4, 7), List.of());
+
+            assertThat(out.whiteHp()).isEqualTo(PlayerResources.DEFAULT_HP);
+            assertThat(out.blackHp()).isEqualTo(PlayerResources.DEFAULT_HP - 10);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    void finalizeBattleRoundEvaluation_blackOpeningCheck_skipsCentipawnHpUsesStaticTen() {
+        var deps = deps();
+        when(deps.matches.findByIdForUpdate(1)).thenReturn(Optional.of(inProgressMatch(1)));
+        when(deps.redisState.getCachedBattleEval(1, 8)).thenReturn(Optional.empty());
+        when(deps.redisState.tryMarkBattleRoundApplied(1, 8)).thenReturn(true);
+        MatchPlayer mp10 = new MatchPlayer();
+        mp10.setUserId(10L);
+        MatchPlayer mp20 = new MatchPlayer();
+        mp20.setUserId(20L);
+        when(deps.matchPlayers.findAllByMatchId(1)).thenReturn(List.of(mp10, mp20));
+        when(deps.redisState.getBench(eq(1), eq(10L))).thenReturn(List.of());
+        when(deps.redisState.getBench(eq(1), eq(20L))).thenReturn(List.of());
+        when(deps.redisState.getPlayerBoard(eq(1), eq(10L))).thenReturn(List.of());
+        when(deps.redisState.getPlayerBoard(eq(1), eq(20L))).thenReturn(List.of());
+        when(deps.pieces.findByNameIgnoreCase("Pawn")).thenReturn(Optional.of(piece(101, "Pawn", 1)));
+        when(deps.pieces.findByNameIgnoreCase("Knight")).thenReturn(Optional.of(piece(102, "Knight", 3)));
+        when(deps.pieces.findByNameIgnoreCase("Bishop")).thenReturn(Optional.of(piece(103, "Bishop", 3)));
+        when(deps.pieces.findByNameIgnoreCase("Rook")).thenReturn(Optional.of(piece(104, "Rook", 5)));
+        when(deps.pieces.findByNameIgnoreCase("Queen")).thenReturn(Optional.of(piece(105, "Queen", 8)));
+        PlayerResources white = resources(1, 10L, 3, 30);
+        PlayerResources black = resources(1, 20L, 3, 30);
+        when(deps.resources.findByMatchIdAndUserId(1, 10L)).thenReturn(Optional.of(white));
+        when(deps.resources.findByMatchIdAndUserId(1, 20L)).thenReturn(Optional.of(black));
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            BattleRoundEvaluationResponse out = deps.sut().finalizeBattleRoundEvaluation(
+                    1, 8, 10L, 10L, 20L, FEN_BLACK_KING_IN_CHECK, 250, "white",
+                    List.of(), List.of(),
+                    new KingSquareResponse(4, 7), new KingSquareResponse(4, 7), List.of("e2e4"));
+
+            assertThat(out.blackHp()).isEqualTo(PlayerResources.DEFAULT_HP - 10);
         } finally {
             TransactionSynchronizationManager.clearSynchronization();
         }

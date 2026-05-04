@@ -3,6 +3,7 @@ package org.java.diploma.service.game.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.java.diploma.service.game.analytics.AnalyticsEventPublisher;
+import org.java.diploma.service.game.chess.BattleFenRules;
 import org.java.diploma.service.game.dto.BattleRoundEvaluationResponse;
 import org.java.diploma.service.game.dto.BattleRoundHpSnapshot;
 import org.java.diploma.service.game.dto.BenchSlotResponse;
@@ -87,6 +88,8 @@ public class GameService {
     private static final String MATCH_RETRIEVED = "Match retrieved: matchId={}";
     private static final String MATCH_STARTED = "Match started: matchId={}";
     private static final String LOG_BATTLE_HP = "Battle HP update: matchId={}, centipawns={}, loserUserId={}, damage={}";
+    private static final String LOG_BATTLE_OPENING_CHECK =
+            "Battle opening check on Black: matchId={}, blackHpDamage={}";
     private static final String LOG_BATTLE_PAWNS = "Battle round pawn income: matchId={}, userId={}, +{}";
 
     /**
@@ -94,6 +97,11 @@ public class GameService {
      * show higher advantages; actual HP loss is capped here (currently 10 per round).
      */
     private static final int BATTLE_HP_MAX_DAMAGE_PAWNS_ROUNDED = 10;
+    /**
+     * When the battle FEN has Black in check, HP damage for the round is exactly this value for Black — centipawn-based
+     * HP damage is skipped for that round.
+     */
+    private static final int BATTLE_BLACK_OPENING_CHECK_HP = 10;
     /** Each side receives this many pawns (gold) when a battle round is resolved. */
     private static final int BATTLE_ROUND_PAWNS_PER_SIDE = 2;
     /** Shared battle presentation window so both clients can replay and transition in lockstep. */
@@ -276,8 +284,9 @@ public class GameService {
     }
 
     /**
-     * Persists battle round outcome: HP loss for the losing side (≈ rounded pawn eval {@code |cp|/100}), then +2
-     * pawns (gold) for White and for Black. Idempotent per match Redis shop-round.
+     * Persists battle round outcome: HP loss from rounded pawn eval ({@code |cp|/100}) unless the battle FEN has Black's
+     * king in check — then Black loses only the fixed opening-check HP ({@link #BATTLE_BLACK_OPENING_CHECK_HP}) and
+     * eval-based HP is skipped; then +2 pawns (gold) for White and for Black. Idempotent per match Redis shop-round.
      */
     @Transactional
     public BattleRoundEvaluationResponse finalizeBattleRoundEvaluation(
@@ -353,7 +362,7 @@ public class GameService {
         }
 
         AppliedBattleOutcome applied = applyBattleRoundOutcome(
-                matchLocked, matchId, whiteUserId, blackUserId, centipawns);
+                matchLocked, matchId, whiteUserId, blackUserId, centipawns, fen);
         persistRuntimeShopStateToDatabase(matchId);
 
         BattleRoundEvaluationResponse response = new BattleRoundEvaluationResponse(
@@ -436,7 +445,8 @@ public class GameService {
             Integer matchId,
             long whiteUserId,
             long blackUserId,
-            int centipawns
+            int centipawns,
+            String battleFen
     ) {
         PlayerResources whiteDb = resources.findByMatchIdAndUserId(matchId, whiteUserId)
                 .orElseThrow(() -> new IllegalStateException("Player resources not found"));
@@ -453,7 +463,19 @@ public class GameService {
         long loserId = 0L;
         long winnerId = 0L;
         boolean justEliminated = false;
-        if (centipawns != 0) {
+        if (BattleFenRules.isBlackKingInCheck(battleFen)) {
+            int blackHpBefore = blackHp;
+            blackHp = Math.max(0, blackHp - BATTLE_BLACK_OPENING_CHECK_HP);
+            int dealt = blackHpBefore - blackHp;
+            if (dealt > 0) {
+                logger.info(LOG_BATTLE_OPENING_CHECK, matchId, dealt);
+            }
+            if (blackHpBefore > 0 && blackHp == 0) {
+                justEliminated = true;
+                winnerId = whiteUserId;
+                loserId = blackUserId;
+            }
+        } else if (centipawns != 0) {
             loserId = centipawns > 0 ? blackUserId : whiteUserId;
             winnerId = loserId == whiteUserId ? blackUserId : whiteUserId;
             int loserHpBefore = loserId == whiteUserId ? whiteHp : blackHp;

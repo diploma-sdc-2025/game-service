@@ -32,7 +32,7 @@ public class PlayerResources {
     public static final int DEFAULT_LEVEL = 1;
     public static final int DEFAULT_EXPERIENCE = 0;
     /** Starting / max HP for the vertical HP bar (battle damage subtracts from this). */
-    public static final int DEFAULT_HP = 50;
+    public static final int DEFAULT_HP = 30;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

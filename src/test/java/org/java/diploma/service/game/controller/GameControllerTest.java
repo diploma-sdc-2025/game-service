@@ -171,8 +171,8 @@ class GameControllerTest {
                 new KingSquareResponse(4, 7),
                 List.of("e2e4"),
                 100L,
-                99,
-                98,
+                28,
+                27,
                 false,
                 null
         );
