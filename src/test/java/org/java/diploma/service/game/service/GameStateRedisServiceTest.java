@@ -10,6 +10,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -17,6 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -87,6 +89,102 @@ class GameStateRedisServiceTest {
 
         assertThat(service.getState(2)).isEqualTo("state");
         assertThat(service.getBoard(2)).isEqualTo("board");
+    }
+
+    @Test
+    void boardSquareOperations_roundTrip() {
+        when(hashOps.get("game:playerBoard:1:2", "3:4")).thenReturn("pawn");
+        when(hashOps.hasKey("game:playerBoard:1:2", "3:4")).thenReturn(true);
+
+        service.setPlayerBoardSquare(1, 2, 3, 4, "pawn");
+        service.clearPlayerBoardSquare(1, 2, 3, 4);
+
+        assertThat(service.getPlayerBoardPieceKey(1, 2, 3, 4)).isEqualTo("pawn");
+        assertThat(service.isPlayerBoardSquareOccupied(1, 2, 3, 4)).isTrue();
+        verify(hashOps).put("game:playerBoard:1:2", "3:4", "pawn");
+        verify(hashOps).delete("game:playerBoard:1:2", "3:4");
+    }
+
+    @Test
+    void getPlayerBoard_ignoresMalformedEntries() {
+        when(hashOps.entries("game:playerBoard:3:9")).thenReturn(Map.of(
+                "1:6", "pawn",
+                "bad", "rook",
+                "2:not", "bishop"
+        ));
+
+        var board = service.getPlayerBoard(3, 9);
+
+        assertThat(board).containsExactly(new GameStateRedisService.RuntimeBoardPiece(1, 6, "pawn"));
+    }
+
+    @Test
+    void replacePlayerBoard_deletesAndReplacesEntries() {
+        service.replacePlayerBoard(5, 6, List.of(
+                new GameStateRedisService.RuntimeBoardPiece(1, 6, "pawn"),
+                new GameStateRedisService.RuntimeBoardPiece(2, 5, "knight")
+        ));
+
+        verify(redis).delete("game:playerBoard:5:6");
+        verify(hashOps).put("game:playerBoard:5:6", "1:6", "pawn");
+        verify(hashOps).put("game:playerBoard:5:6", "2:5", "knight");
+    }
+
+    @Test
+    void replacePlayerBoard_withEmptyListOnlyDeletes() {
+        service.replacePlayerBoard(5, 6, List.of());
+        verify(redis).delete("game:playerBoard:5:6");
+        verify(hashOps, never()).put(anyString(), any(), any());
+    }
+
+    @Test
+    void playerBoardAndBenchDataPresence_checksHashSize() {
+        when(hashOps.size("game:playerBoard:1:2")).thenReturn(2L);
+        when(hashOps.size("game:playerBench:1:2")).thenReturn(0L);
+
+        assertThat(service.hasAnyPlayerBoardData(1, 2)).isTrue();
+        assertThat(service.hasAnyBenchData(1, 2)).isFalse();
+    }
+
+    @Test
+    void playerResourceReadsFallbackOnMalformedValues() {
+        when(hashOps.get("game:playerRes:1:2", "gold")).thenReturn("bad");
+        when(hashOps.get("game:playerRes:1:2", "hp")).thenReturn(null);
+
+        assertThat(service.getPlayerGold(1, 2, 7)).isEqualTo(7);
+        assertThat(service.getPlayerHp(1, 2, 21)).isEqualTo(21);
+    }
+
+    @Test
+    void playerResourceWritesAndInitIfAbsent() {
+        when(redis.hasKey("game:playerRes:4:5")).thenReturn(false, true);
+
+        service.initPlayerResourcesIfAbsent(4, 5, 3, 30);
+        service.initPlayerResourcesIfAbsent(4, 5, 9, 99);
+        service.setPlayerGold(4, 5, 8);
+        service.setPlayerHp(4, 5, 22);
+
+        verify(hashOps).putAll("game:playerRes:4:5", Map.of("gold", "3", "hp", "30"));
+        verify(hashOps).put("game:playerRes:4:5", "gold", "8");
+        verify(hashOps).put("game:playerRes:4:5", "hp", "22");
+    }
+
+    @Test
+    void benchOperations_roundTripAndReplace() {
+        when(hashOps.get("game:playerBench:2:3", "1")).thenReturn("pawn");
+        when(hashOps.hasKey("game:playerBench:2:3", "1")).thenReturn(true);
+        when(hashOps.entries("game:playerBench:2:3")).thenReturn(Map.of("1", "pawn", "bad", "x"));
+
+        service.setBenchSlot(2, 3, 1, "pawn");
+        service.clearBenchSlot(2, 3, 1);
+        assertThat(service.getBenchSlotPieceKey(2, 3, 1)).isEqualTo("pawn");
+        assertThat(service.isBenchSlotOccupied(2, 3, 1)).isTrue();
+        assertThat(service.getBench(2, 3))
+                .containsExactly(new GameStateRedisService.RuntimeBenchPiece(1, "pawn"));
+
+        service.replaceBench(2, 3, List.of(new GameStateRedisService.RuntimeBenchPiece(0, "knight")));
+        verify(redis).delete("game:playerBench:2:3");
+        verify(hashOps).put("game:playerBench:2:3", "0", "knight");
     }
 
     @Test
@@ -191,6 +289,13 @@ class GameStateRedisServiceTest {
     }
 
     @Test
+    void getLastBattleEval_returnsEmptyWhenEitherFieldMissing() {
+        when(stringValueOps.get("game:lastBattleRound:v1:9")).thenReturn(null);
+        when(stringValueOps.get("game:lastBattleEval:v1:9")).thenReturn("{\"y\":2}");
+        assertThat(service.getLastBattleEval(9)).isEmpty();
+    }
+
+    @Test
     void markAndCheckBattleViewedState() {
         when(setOps.isMember("game:battleViewed:v1:8:3", "11")).thenReturn(true);
 
@@ -199,5 +304,28 @@ class GameStateRedisServiceTest {
         service.markBattleViewedByUser(8, 3, 11);
         verify(setOps).add("game:battleViewed:v1:8:3", "11");
         verify(stringRedis).expire("game:battleViewed:v1:8:3", Duration.ofHours(48));
+    }
+
+    @Test
+    void tryMarkBattleRoundApplied_returnsBooleanFromSetIfAbsent() {
+        when(stringValueOps.setIfAbsent("game:battleApplied:v1:8:4", "1", Duration.ofHours(48))).thenReturn(true, false, null);
+
+        assertThat(service.tryMarkBattleRoundApplied(8, 4)).isTrue();
+        assertThat(service.tryMarkBattleRoundApplied(8, 4)).isFalse();
+        assertThat(service.tryMarkBattleRoundApplied(8, 4)).isFalse();
+    }
+
+    @Test
+    void runtimeTouchedFlags_useRedisKeys() {
+        when(redis.hasKey("game:runtimeBoardTouched:v1:1:2")).thenReturn(true);
+        when(redis.hasKey("game:runtimeBenchTouched:v1:1:2")).thenReturn(false);
+
+        assertThat(service.isRuntimeShopBoardTouched(1, 2)).isTrue();
+        assertThat(service.isRuntimeShopBenchTouched(1, 2)).isFalse();
+
+        service.markRuntimeShopBoardTouched(1, 2);
+        service.markRuntimeShopBenchTouched(1, 2);
+        verify(valueOps).set("game:runtimeBoardTouched:v1:1:2", "1");
+        verify(valueOps).set("game:runtimeBenchTouched:v1:1:2", "1");
     }
 }

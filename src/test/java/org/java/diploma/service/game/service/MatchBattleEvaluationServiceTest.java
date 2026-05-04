@@ -13,6 +13,7 @@ import org.java.diploma.service.game.repository.PieceRepository;
 import org.java.diploma.service.game.repository.PlayerInventoryRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
 import java.util.List;
 import java.util.Optional;
@@ -21,7 +22,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -100,6 +104,49 @@ class MatchBattleEvaluationServiceTest {
         assertThatThrownBy(() -> service.evaluateRound(1, 10L))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("King positions not available");
+    }
+
+    @Test
+    void evaluateRound_usesLastBattleCacheWhenStillInViewWindow() throws Exception {
+        when(matchPlayers.existsByMatchIdAndUserId(1, 10L)).thenReturn(true);
+        when(matchPlayers.findAllByMatchId(1)).thenReturn(List.of(player(10L), player(20L)));
+        when(redisState.getShopRound(1)).thenReturn(4);
+        when(redisState.hasAnyPlayerBoardData(anyInt(), anyLong())).thenReturn(true);
+        when(redisState.getPlayerBoard(1, 10L)).thenReturn(List.of(new GameStateRedisService.RuntimeBoardPiece(1, 6, "pawn")));
+        when(redisState.getPlayerBoard(1, 20L)).thenReturn(List.of(new GameStateRedisService.RuntimeBoardPiece(1, 6, "pawn")));
+        when(redisState.getKingSquare(1, 10L)).thenReturn(new KingSquareResponse(4, 7));
+        when(redisState.getKingSquare(1, 20L)).thenReturn(new KingSquareResponse(4, 7));
+        when(redisState.getCachedBattleEval(1, 4)).thenReturn(Optional.empty());
+        BattleRoundEvaluationResponse cachedLast = new BattleRoundEvaluationResponse(
+                "fen", 100, "white", 10L, 20L, true,
+                List.of(), List.of(), new KingSquareResponse(4, 7), new KingSquareResponse(4, 7),
+                List.of("e2e4"), System.currentTimeMillis() + 10_000, 30, 25, false, null);
+        when(redisState.getLastBattleEval(1))
+                .thenReturn(Optional.of(new GameStateRedisService.LastBattleEval(3, objectMapper.writeValueAsString(cachedLast))));
+
+        BattleRoundEvaluationResponse out = service.evaluateRound(1, 10L);
+
+        assertThat(out.currentUserIsWhite()).isTrue();
+        verify(redisState).markBattleViewedByUser(1, 3, 10L);
+        verify(gameService, never()).finalizeBattleRoundEvaluation(anyInt(), anyInt(), anyLong(), anyLong(), anyLong(), anyString(), anyInt(), anyString(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void evaluateRound_throwsWhenBattleServiceReturnsEmptyBody() {
+        when(matchPlayers.existsByMatchIdAndUserId(1, 10L)).thenReturn(true);
+        when(matchPlayers.findAllByMatchId(1)).thenReturn(List.of(player(10L), player(20L)));
+        when(redisState.getShopRound(1)).thenReturn(5);
+        when(redisState.hasAnyPlayerBoardData(anyInt(), anyLong())).thenReturn(true);
+        when(redisState.getPlayerBoard(1, 10L)).thenReturn(List.of());
+        when(redisState.getPlayerBoard(1, 20L)).thenReturn(List.of());
+        when(redisState.getKingSquare(1, 10L)).thenReturn(new KingSquareResponse(4, 7));
+        when(redisState.getKingSquare(1, 20L)).thenReturn(new KingSquareResponse(4, 7));
+        when(redisState.getCachedBattleEval(1, 5)).thenReturn(Optional.empty());
+        when(redisState.getLastBattleEval(1)).thenReturn(Optional.empty());
+        when(battleRestClient.post()).thenThrow(new RestClientException("down"));
+        assertThatThrownBy(() -> service.evaluateRound(1, 10L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Battle engine unavailable");
     }
 
     private MatchPlayer player(long userId) {
